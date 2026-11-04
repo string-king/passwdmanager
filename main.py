@@ -1,9 +1,11 @@
 import base64
 import getpass
+import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
+import uuid
 import warnings
 
 from cryptography.exceptions import InvalidKey, UnsupportedAlgorithm
@@ -156,21 +158,74 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
     return Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
 
 
-def run_vault(session: Session) -> bool:
+def validate_entry_field(value: str, label: str):
+    if not value.strip() or len(value) > 256 or not value.isprintable():
+        raise ValueError(f"{label} must contain 1 to 256 printable characters.")
+
+
+def add_entry(
+    database: sqlite3.Connection, session: Session,
+    service: str, username: str, password: str,
+) -> str:
+    if session.cipher is None:
+        raise ValueError("Vault is locked. Log in again.")
+    validate_entry_field(service, "Service")
+    validate_entry_field(username, "Entry username")
+    if not 1 <= len(password) <= 1024:
+        raise ValueError("Entry password must contain 1 to 1024 characters.")
+
+    entry_id = uuid.uuid4().hex
+    entry = {
+        "id": entry_id,
+        "owner_id": session.owner_id,
+        "service": service,
+        "username": username,
+        "password": password,
+    }
+    # Encrypt all credential fields together. Only ciphertext reaches SQLite.
+    # Encrypted IDs will let us detect payloads moved to another record on read.
+    payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    with database:
+        database.execute(
+            "INSERT INTO entries (id, owner_id, payload) VALUES (?, ?, ?)",
+            (entry_id, session.owner_id, payload),
+        )
+    return entry_id
+
+
+def run_vault(database: sqlite3.Connection, session: Session) -> bool:
     """Return True to exit the application, or False to return to login."""
     try:
         clear_console()
-        print("Vault unlocked. Entry operations are not implemented yet.")
+        print("Vault unlocked.")
         while True:
-            print("\n1. Lock / log out")
-            print("2. Exit")
+            print("\n1. Add entry")
+            print("2. Lock / log out")
+            print("3. Exit")
             choice = input("Choice: ")
             clear_console()
             if choice == "1":
+                try:
+                    service = input("Service: ")
+                    validate_entry_field(service, "Service")
+                    username = input("Username/email: ")
+                    validate_entry_field(username, "Entry username")
+                    password = read_password("Entry password: ")
+                    try:
+                        add_entry(database, session, service, username, password)
+                    finally:
+                        del password
+                    clear_console()
+                    print("Entry saved.")
+                except ValueError as error:
+                    clear_console()
+                    print(error)
+            elif choice == "2":
                 return False
-            if choice == "2":
+            elif choice == "3":
                 return True
-            print("Choose 1 or 2.")
+            else:
+                print("Choose 1, 2, or 3.")
     finally:
         # Also lock when Ctrl-C, EOF, or an unexpected error interrupts the menu.
         session.lock()
@@ -219,7 +274,7 @@ def run(database: sqlite3.Connection):
                 continue
             finally:
                 del password
-            if run_vault(session):
+            if run_vault(database, session):
                 return
         elif choice == "3":
             return
