@@ -1,3 +1,4 @@
+import base64
 import getpass
 import os
 from pathlib import Path
@@ -5,7 +6,8 @@ import sqlite3
 import sys
 import warnings
 
-from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.exceptions import InvalidKey, UnsupportedAlgorithm
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 
@@ -13,6 +15,16 @@ DATABASE = Path(__file__).resolve().parent / "data" / "passwords.db"
 KDF_ITERATIONS = 3
 KDF_LANES = 4
 KDF_MEMORY_COST = 64 * 1024  # KiB: 64 MiB of memory per derivation
+
+
+class Session:
+    def __init__(self, owner_id: int, cipher: Fernet):
+        self.owner_id = owner_id
+        self.cipher = cipher
+
+    def lock(self):
+        # Release the encryption object; this does not guarantee memory erasure.
+        self.cipher = None
 
 
 def open_database(path: Path = DATABASE) -> sqlite3.Connection:
@@ -65,23 +77,38 @@ def read_password(prompt: str) -> str:
         return getpass.getpass(prompt)
 
 
-def register_account(database: sqlite3.Connection, username: str, password: str):
-    if not username.strip() or len(username) > 64 or not username.isprintable():
-        raise ValueError("Username must contain 1 to 64 printable characters.")
+def clear_console():
+    if sys.stdout.isatty():
+        # Clear the visible terminal screen and move the cursor to the top.
+        print("\033[2J\033[H", end="", flush=True)
+
+
+def validate_master_password(password: str):
     if not 12 <= len(password) <= 1024:
         raise ValueError("Master password must contain 12 to 1024 characters.")
 
-    verification_salt = os.urandom(16)
-    # The encryption key will use its own salt, separate from password checking.
-    key_salt = os.urandom(16)
-    kdf = Argon2id(
-        salt=verification_salt,
+
+def password_kdf(salt: bytes) -> Argon2id:
+    if not isinstance(salt, bytes) or len(salt) != 16:
+        raise ValueError("Invalid account metadata.")
+    return Argon2id(
+        salt=salt,
         length=32,
         iterations=KDF_ITERATIONS,
         lanes=KDF_LANES,
         memory_cost=KDF_MEMORY_COST,
     )
-    verifier = kdf.derive(password.encode("utf-8"))
+
+
+def register_account(database: sqlite3.Connection, username: str, password: str):
+    if not username.strip() or len(username) > 64 or not username.isprintable():
+        raise ValueError("Username must contain 1 to 64 printable characters.")
+    validate_master_password(password)
+
+    verification_salt = os.urandom(16)
+    # The encryption key will use its own salt, separate from password checking.
+    key_salt = os.urandom(16)
+    verifier = password_kdf(verification_salt).derive(password.encode("utf-8"))
 
     try:
         # Commit the complete account on success, or roll back if saving fails.
@@ -97,33 +124,103 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
         raise ValueError("Username is already taken.") from None
 
 
+def login_account(database: sqlite3.Connection, username: str, password: str) -> Session:
+    failure = "Invalid username or master password."
+    if not username.strip() or len(username) > 64 or not username.isprintable():
+        raise ValueError(failure)
+    if not 1 <= len(password) <= 1024:
+        raise ValueError(failure)
+
+    user = database.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if user is None:
+        raise ValueError(failure)
+
+    # Treat the database as untrusted: do not accept arbitrary Argon2 costs.
+    settings = (user["iterations"], user["lanes"], user["memory_cost"])
+    if settings != (KDF_ITERATIONS, KDF_LANES, KDF_MEMORY_COST):
+        raise ValueError("Unsupported account key-derivation settings.")
+    if not isinstance(user["verifier"], bytes) or len(user["verifier"]) != 32:
+        raise ValueError("Invalid account metadata.")
+
+    try:
+        password_kdf(user["verification_salt"]).verify(
+            password.encode("utf-8"), user["verifier"]
+        )
+    except InvalidKey:
+        raise ValueError(failure) from None
+
+    # Derive the vault key only after verification, using the independent salt.
+    key = password_kdf(user["key_salt"]).derive(password.encode("utf-8"))
+    return Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+
+
+def run_vault(session: Session) -> bool:
+    """Return True to exit the application, or False to return to login."""
+    try:
+        clear_console()
+        print("Vault unlocked. Entry operations are not implemented yet.")
+        while True:
+            print("\n1. Lock / log out")
+            print("2. Exit")
+            choice = input("Choice: ")
+            clear_console()
+            if choice == "1":
+                return False
+            if choice == "2":
+                return True
+            print("Choose 1 or 2.")
+    finally:
+        # Also lock when Ctrl-C, EOF, or an unexpected error interrupts the menu.
+        session.lock()
+        print("Vault locked.")
+
+
 def run(database: sqlite3.Connection):
+    clear_console()
     while True:
         print("\nPassword manager")
         print("1. Register")
         print("2. Log in")
         print("3. Exit")
         choice = input("Choice: ")
+        clear_console()
 
         if choice == "1":
             username = input("Username: ")
+            print("Master password must contain 12 to 1024 characters.")
             password = read_password("Master password: ")
             try:
+                validate_master_password(password)
                 confirmation = read_password("Confirm master password: ")
                 try:
                     if password != confirmation:
                         raise ValueError("Passwords do not match.")
                     register_account(database, username, password)
-                    print("Account created. Login is not implemented yet.")
+                    clear_console()
+                    print("Account created. Log in to unlock your vault.")
                 finally:
                     del confirmation
             except ValueError as error:
+                clear_console()
                 print(error)
             finally:
                 # Drop references; Python cannot guarantee wiping every copy.
                 del password
         elif choice == "2":
-            print("Login is not implemented yet.")
+            username = input("Username: ")
+            password = read_password("Master password: ")
+            try:
+                session = login_account(database, username, password)
+            except ValueError as error:
+                clear_console()
+                print(error)
+                continue
+            finally:
+                del password
+            if run_vault(session):
+                return
         elif choice == "3":
             return
         else:
