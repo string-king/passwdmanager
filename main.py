@@ -18,6 +18,7 @@ DATABASE = Path(__file__).resolve().parent / "data" / "passwords.db"
 KDF_ITERATIONS = 3
 KDF_LANES = 4
 KDF_MEMORY_COST = 64 * 1024  # KiB: 64 MiB of memory per derivation
+PAGE_SIZE = 10
 
 
 class Session:
@@ -266,6 +267,41 @@ def print_entries(entries: list[dict]):
         print(" | ".join(value.ljust(width) for value, width in zip(row, widths)))
 
 
+def browse_entries(entries: list[dict]):
+    page = 0
+    page_count = max(1, (len(entries) + PAGE_SIZE - 1) // PAGE_SIZE)
+    message = ""
+    while True:
+        clear_console()
+        start = page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, len(entries))
+        print(f"Page {page + 1} of {page_count} | {len(entries)} entries")
+        if entries:
+            print(f"Showing {start + 1}-{end}, newest first.\n")
+        print_entries(entries[start:end])
+        if message:
+            print(f"\n{message}")
+
+        print("\n[N] Next  [P] Previous  [B] Back")
+        choice = input("Choice: ").strip().lower()
+        message = ""
+        if choice == "n":
+            if page + 1 < page_count:
+                page += 1
+            else:
+                message = "Already on the last page."
+        elif choice == "p":
+            if page > 0:
+                page -= 1
+            else:
+                message = "Already on the first page."
+        elif choice == "b":
+            clear_console()
+            return
+        else:
+            message = "Choose N, P, or B."
+
+
 def run_vault(database: sqlite3.Connection, session: Session) -> bool:
     """Return True to exit the application, or False to return to login."""
     try:
@@ -297,7 +333,7 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
             elif choice == "2":
                 try:
                     entries = list_entries(database, session)
-                    print_entries(entries)
+                    browse_entries(entries)
                 except ValueError as error:
                     print(error)
             elif choice == "3":
