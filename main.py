@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime, timezone
 import getpass
 import json
 import os
@@ -9,7 +10,7 @@ import uuid
 import warnings
 
 from cryptography.exceptions import InvalidKey, UnsupportedAlgorithm
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 
@@ -159,7 +160,7 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
 
 
 def validate_entry_field(value: str, label: str):
-    if not value.strip() or len(value) > 256 or not value.isprintable():
+    if not isinstance(value, str) or not value.strip() or len(value) > 256 or not value.isprintable():
         raise ValueError(f"{label} must contain 1 to 256 printable characters.")
 
 
@@ -181,6 +182,7 @@ def add_entry(
         "service": service,
         "username": username,
         "password": password,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # Encrypt all credential fields together. Only ciphertext reaches SQLite.
     # Encrypted IDs will let us detect payloads moved to another record on read.
@@ -193,6 +195,77 @@ def add_entry(
     return entry_id
 
 
+def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
+    if session.cipher is None:
+        raise ValueError("Vault is locked. Log in again.")
+
+    rows = database.execute(
+        "SELECT id, payload FROM entries WHERE owner_id = ? ORDER BY rowid",
+        (session.owner_id,),
+    ).fetchall()
+    summaries = []
+    for row in rows:
+        try:
+            entry = json.loads(session.cipher.decrypt(row["payload"]))
+            if not isinstance(entry, dict):
+                raise ValueError
+            # A valid encrypted payload must belong to this exact row and user.
+            if entry["id"] != row["id"] or entry["owner_id"] != session.owner_id:
+                raise ValueError
+            validate_entry_field(entry["id"], "Entry ID")
+            validate_entry_field(entry["service"], "Service")
+            validate_entry_field(entry["username"], "Entry username")
+            if not isinstance(entry["password"], str) or not 1 <= len(entry["password"]) <= 1024:
+                raise ValueError
+            # Older entries have no timestamp; do not invent an update time.
+            updated_at = None
+            if "updated_at" in entry:
+                updated_at = datetime.fromisoformat(entry["updated_at"])
+                if updated_at.tzinfo is None:
+                    raise ValueError
+                updated_at = updated_at.astimezone(timezone.utc)
+        except (InvalidToken, ValueError, TypeError, KeyError, OverflowError):
+            raise ValueError("Entry integrity check failed. Vault data may be damaged.") from None
+
+        # Return only display data so the interface never receives the password.
+        summaries.append({
+            "id": row["id"],
+            "service": entry["service"],
+            "username": entry["username"],
+            "password": "********",
+            "updated_at": updated_at,
+        })
+    # Entries without a known time appear last. Equal times retain their order.
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(summaries, key=lambda entry: entry["updated_at"] or oldest, reverse=True)
+
+
+def print_entries(entries: list[dict]):
+    if not entries:
+        print("Vault is empty.")
+        return
+
+    headers = ["Service", "Username/email", "Password", "Last updated"]
+    rows = []
+    for entry in entries:
+        updated_at = entry["updated_at"]
+        time_text = updated_at.astimezone().strftime("%Y-%m-%d %H:%M") if updated_at else "Unknown"
+        # Keep long fields from making the table excessively wide.
+        service = entry["service"]
+        username = entry["username"]
+        if len(service) > 24:
+            service = service[:21] + "..."
+        if len(username) > 22:
+            username = username[:19] + "..."
+        rows.append([service, username, "********", time_text])
+
+    widths = [max(len(row[column]) for row in [headers, *rows]) for column in range(4)]
+    print(" | ".join(value.ljust(width) for value, width in zip(headers, widths)))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows:
+        print(" | ".join(value.ljust(width) for value, width in zip(row, widths)))
+
+
 def run_vault(database: sqlite3.Connection, session: Session) -> bool:
     """Return True to exit the application, or False to return to login."""
     try:
@@ -200,8 +273,9 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
         print("Vault unlocked.")
         while True:
             print("\n1. Add entry")
-            print("2. Lock / log out")
-            print("3. Exit")
+            print("2. List entries")
+            print("3. Lock / log out")
+            print("4. Exit")
             choice = input("Choice: ")
             clear_console()
             if choice == "1":
@@ -221,11 +295,17 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
                     clear_console()
                     print(error)
             elif choice == "2":
-                return False
+                try:
+                    entries = list_entries(database, session)
+                    print_entries(entries)
+                except ValueError as error:
+                    print(error)
             elif choice == "3":
+                return False
+            elif choice == "4":
                 return True
             else:
-                print("Choose 1, 2, or 3.")
+                print("Choose 1, 2, 3, or 4.")
     finally:
         # Also lock when Ctrl-C, EOF, or an unexpected error interrupts the menu.
         session.lock()
