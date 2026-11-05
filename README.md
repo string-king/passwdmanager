@@ -2,10 +2,17 @@
 
 A password manager for the ICS0022 Secure Programming project.
 
+## Current status
+
+Registration, login, encrypted credential storage, and clipboard retrieval are
+implemented in `passwdmanager.py`. Entries are listed in pages of 10, newest
+first. Passwords are never printed. See [PROGRESS.md](PROGRESS.md) for a short
+checkpoint 2 progress note.
+
 ## Checkpoint 1: scope
 
-This README is the initial design document. The features below are planned;
-the application has not been implemented yet.
+The design and threat model below were written for checkpoint 1. They describe
+the intended application, including features that are still planned.
 
 The application will use Python and a terminal interface, initially on macOS.
 Each account will have a username, a master password, and its own set of encrypted
@@ -102,45 +109,45 @@ memory. This limitation will need further attention for the later memory-handlin
 requirement. Clipboard history may retain copied passwords, and clearing cannot
 be guaranteed after a crash or forced exit.
 
-## Planned terminal screens
+## Current terminal menus
 
-The application will use numbered menus:
+The application uses numbered menus:
 
 ```text
 Start menu                 Unlocked vault
 1. Register                1. Add entry
-2. Log in                  2. List entries (passwords masked)
-3. Exit                    3. Copy password
-                           4. Update entry
-                           5. Delete entry
-                           6. Lock / log out
-                           7. Exit
+2. Log in                  2. List entries
+3. Exit                    3. Lock / log out
+                           4. Exit
 ```
 
-Registration and login will prompt for the username and master password.
-The copy option will select an entry by its ID without displaying the password.
+Registration and login prompt for a username and a hidden master password.
+New master passwords must contain 12 to 1024 characters.
+In List entries, use N/P to change pages, B to go back, or a row number to copy
+that entry's password. Row numbers restart on each page. The application attempts
+to clear copied passwords after 20 seconds and on logout/exit, if unchanged.
 
 ## Setup and run
 
-Planned requirements: macOS, Python 3.12 or newer with its built-in `sqlite3`
+Requirements: macOS, Python 3.15 with its built-in `sqlite3`
 module, and the `cryptography` package. No separate database installation is needed.
 Python does not require a separate compilation step for this application.
 
 The development environment can be prepared from the repository directory:
 
 ```sh
-python3 -m venv .venv
+python3.15 -m venv .venv
 source .venv/bin/activate
-python -m pip install cryptography
+python -m pip install -r requirements.txt
 ```
 
-The planned launch command is:
+Run in an interactive terminal:
 
 ```sh
-python main.py
+python passwdmanager.py
 ```
 
-`main.py` has not been implemented yet, so the launch command is planned rather
-than currently usable. The application will create the database and tables on
-first launch. Local database files, logs, and the virtual environment will be
-excluded from Git.
+The application creates `data/passwords.db` on first launch. No separate build
+step is needed. Local database files, logs, and the virtual environment are
+excluded from Git. Use Lock / log out when stepping away; automatic locking is
+not implemented yet.
