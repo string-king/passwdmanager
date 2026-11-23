@@ -1,6 +1,7 @@
 """Real macOS terminal checks, isolated from the unit tests."""
 
 import sys
+import signal
 import unittest
 
 
@@ -50,15 +51,19 @@ else:
                             if not chunk:
                                 break
                             output += chunk
-                    child, status = os.waitpid(pid, os.WNOHANG)
-                    exited = child == pid
+                    while time.monotonic() < deadline:
+                        child, status = os.waitpid(pid, os.WNOHANG)
+                        if child == pid:
+                            exited = True
+                            break
+                        time.sleep(0.01)
                     self.assertTrue(exited, output.decode(errors="replace"))
                     self.assertEqual(os.waitstatus_to_exitcode(status), 0, output.decode(errors="replace"))
                     self.assertIn(b"TIMEOUT_CLEANUP_OK", output)
                 finally:
                     os.close(descriptor)
                     if not exited:
-                        os.kill(pid, pm.signal.SIGKILL)
+                        os.kill(pid, signal.SIGKILL)
                         os.waitpid(pid, 0)
 
 

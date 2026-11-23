@@ -233,6 +233,112 @@ class VaultTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.add_entry(password=value)
 
+    def test_update_preserves_password_and_record_identity(self):
+        entry_id = self.add_entry()
+        before = pm.list_entries(self.database, self.alice)[0]["updated_at"]
+        pm.update_entry(self.database, self.alice, entry_id, "Changed", "new user")
+        entry = pm.load_entry(self.database, self.alice, entry_id)
+        self.assertEqual(entry["service"], "Changed")
+        self.assertEqual(entry["username"], "new user")
+        self.assertEqual(entry["password"], "stored secret")
+        self.assertEqual(entry["id"], entry_id)
+        self.assertEqual(entry["owner_id"], self.alice.owner_id)
+        self.assertGreaterEqual(entry["updated_at"], before)
+
+    def test_update_replaces_password_with_encrypted_storage(self):
+        entry_id = self.add_entry()
+        pm.update_entry(self.database, self.alice, entry_id, "Changed", "new user", "replacement secret")
+        pm.copy_entry_password(self.database, self.alice, entry_id)
+        self.alice.clipboard.copy.assert_called_once_with("replacement secret")
+        payload = self.database.execute("SELECT payload FROM entries WHERE id = ?", (entry_id,)).fetchone()[0]
+        self.assertNotIn(b"replacement secret", payload)
+
+    def test_update_validation_leaves_record_unchanged(self):
+        entry_id = self.add_entry()
+        before = pm.load_entry(self.database, self.alice, entry_id)
+        invalid_changes = [("", "user", None), ("site", "\x1b[2J", None), ("site", "user", "")]
+        for service, username, password in invalid_changes:
+            with self.subTest(service=service, username=username, password=password):
+                with self.assertRaises(ValueError):
+                    pm.update_entry(self.database, self.alice, entry_id, service, username, password)
+                self.assertEqual(pm.load_entry(self.database, self.alice, entry_id), before)
+
+    def test_update_and_delete_reject_other_users_and_missing_records(self):
+        entry_id = self.add_entry()
+        for identifier in [entry_id, "missing", "' OR 1=1 --"]:
+            with self.subTest(identifier=identifier):
+                with self.assertRaisesRegex(ValueError, "not found"):
+                    pm.update_entry(self.database, self.bob, identifier, "changed", "user")
+                with self.assertRaisesRegex(ValueError, "not found"):
+                    pm.delete_entry(self.database, self.bob, identifier)
+        self.assertEqual(pm.load_entry(self.database, self.alice, entry_id)["service"], "Example")
+
+    def test_delete_removes_only_selected_record(self):
+        first = self.add_entry()
+        second = self.add_entry(service="Other")
+        pm.delete_entry(self.database, self.alice, first)
+        self.assertEqual([entry["id"] for entry in pm.list_entries(self.database, self.alice)], [second])
+        with self.assertRaisesRegex(ValueError, "not found"):
+            pm.delete_entry(self.database, self.alice, first)
+
+    def test_update_and_delete_reject_locked_and_expired_sessions(self):
+        entry_id = self.add_entry()
+        self.alice.deadline = pm.time.monotonic() - 1
+        with self.assertRaises(pm.SessionExpired):
+            pm.update_entry(self.database, self.alice, entry_id, "changed", "user")
+        with self.assertRaisesRegex(ValueError, "locked"):
+            pm.delete_entry(self.database, self.alice, entry_id)
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM entries").fetchone()[0], 1)
+
+    def test_update_rejects_tampered_record(self):
+        entry_id = self.add_entry()
+        self.database.execute("UPDATE entries SET payload = ? WHERE id = ?", (b"damaged", entry_id))
+        with self.assertRaisesRegex(ValueError, "integrity check failed"):
+            pm.update_entry(self.database, self.alice, entry_id, "changed", "user")
+
+    def test_edit_prompt_keeps_fields_and_password_by_default(self):
+        entry_id = self.add_entry()
+        summary = pm.list_entries(self.database, self.alice)[0]
+        with patch.object(self.alice, "read_input", side_effect=["", "", ""]):
+            pm.prompt_edit_entry(self.database, self.alice, summary)
+        entry = pm.load_entry(self.database, self.alice, entry_id)
+        self.assertEqual(entry["service"], "Example")
+        self.assertEqual(entry["username"], "alice@example.test")
+        self.assertEqual(entry["password"], "stored secret")
+
+    def test_edit_password_is_hidden_and_never_printed(self):
+        self.add_entry()
+        summary = pm.list_entries(self.database, self.alice)[0]
+        output = io.StringIO()
+        with patch.object(self.alice, "read_input", side_effect=["2", "Changed", "user", "y", "replacement secret"]) as reader, \
+                patch.object(pm, "clear_console"), contextlib.redirect_stdout(output):
+            self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Entry updated.")
+        reader.assert_any_call("New entry password: ", hidden=True)
+        self.assertNotIn("replacement secret", output.getvalue())
+        self.assertNotIn("stored secret", output.getvalue())
+
+    def test_delete_requires_exact_confirmation(self):
+        self.add_entry()
+        summary = pm.list_entries(self.database, self.alice)[0]
+        for response in ["", "y", "delete"]:
+            with self.subTest(response=response), patch.object(self.alice, "read_input", side_effect=["3", response]), \
+                    patch.object(pm, "clear_console"), patch("builtins.print"):
+                self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Deletion cancelled.")
+            self.assertEqual(len(pm.list_entries(self.database, self.alice)), 1)
+        with patch.object(self.alice, "read_input", side_effect=["3", "DELETE"]), \
+                patch.object(pm, "clear_console"), patch("builtins.print"):
+            self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Entry deleted.")
+        self.assertEqual(pm.list_entries(self.database, self.alice), [])
+
+    def test_browser_refreshes_after_deleting_last_entry_on_page(self):
+        for number in range(pm.PAGE_SIZE + 1):
+            self.add_entry(service=f"Site {number}")
+        with patch.object(self.alice, "read_input", side_effect=["n", "1", "3", "DELETE", "b"]), \
+                patch.object(pm, "clear_console"), patch("builtins.print") as printer:
+            pm.browse_entries(self.database, self.alice, pm.list_entries(self.database, self.alice))
+        self.assertEqual(len(pm.list_entries(self.database, self.alice)), pm.PAGE_SIZE)
+        printer.assert_any_call(f"Page 1 of 1 | {pm.PAGE_SIZE} entries")
+
     def test_interrupted_vault_menu_always_locks(self):
         for error in [KeyboardInterrupt, EOFError, RuntimeError]:
             session = pm.Session(1, self.alice_cipher)

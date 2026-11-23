@@ -354,17 +354,59 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
     return entry
 
 
-def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id: str):
-    """Re-read an owned entry, verify it, and copy its password without printing."""
+def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) -> dict:
+    """Load and verify one owned record; callers must keep plaintext short-lived."""
     session.require_unlocked()
+    validate_entry_field(entry_id, "Entry ID")
     row = database.execute(
         "SELECT id, payload FROM entries WHERE id = ? AND owner_id = ?",
         (entry_id, session.owner_id),
     ).fetchone()
     if row is None:
         raise ValueError("Entry not found in your vault.")
-    entry = decrypt_entry(session, row)
+    return decrypt_entry(session, row)
+
+
+def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id: str):
+    """Re-read an owned entry and copy its password without printing."""
+    entry = load_entry(database, session, entry_id)
     session.clipboard.copy(entry["password"])
+
+
+def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
+                 service: str, username: str, password: str | None = None):
+    """Update an owned entry; None preserves the existing password."""
+    entry = load_entry(database, session, entry_id)
+    validate_entry_field(service, "Service")
+    validate_entry_field(username, "Entry username")
+    if password is not None:
+        validate_password(password, "Entry password")
+        entry["password"] = password
+    entry["service"] = service
+    entry["username"] = username
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    session.require_unlocked()
+    with database:
+        result = database.execute(
+            "UPDATE entries SET payload = ? WHERE id = ? AND owner_id = ?",
+            (payload, entry_id, session.owner_id),
+        )
+        if result.rowcount != 1:
+            raise ValueError("Entry not found in your vault.")
+
+
+def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
+    """Delete only the authenticated user's selected record."""
+    session.require_unlocked()
+    validate_entry_field(entry_id, "Entry ID")
+    with database:
+        result = database.execute(
+            "DELETE FROM entries WHERE id = ? AND owner_id = ?",
+            (entry_id, session.owner_id),
+        )
+        if result.rowcount != 1:
+            raise ValueError("Entry not found in your vault.")
 
 
 def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
@@ -422,11 +464,12 @@ def print_entries(entries: list[dict]):
 
 
 def browse_entries(database: sqlite3.Connection, session: Session, entries: list[dict]):
-    """Page through display fields and copy passwords by the visible row number."""
+    """Browse display fields and open actions for the selected row."""
     page = 0
-    page_count = max(1, (len(entries) + PAGE_SIZE - 1) // PAGE_SIZE)
     message = ""
     while True:
+        page_count = max(1, (len(entries) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(page, page_count - 1)
         clear_console()
         start = page * PAGE_SIZE
         end = min(start + PAGE_SIZE, len(entries))
@@ -442,7 +485,7 @@ def browse_entries(database: sqlite3.Connection, session: Session, entries: list
             print(session.clipboard.warning)
 
         print("\n[N] Next  [P] Previous  [B] Back")
-        print("Enter a row number to copy its password.")
+        print("Enter a row number for entry actions.")
         choice = session.read_input("Choice: ").strip().lower()
         message = ""
         if choice == "n":
@@ -461,12 +504,49 @@ def browse_entries(database: sqlite3.Connection, session: Session, entries: list
         elif choice in row_numbers:
             selected_entry = page_entries[int(choice) - 1]
             try:
-                copy_entry_password(database, session, selected_entry["id"])
-                message = f"Password copied. Clipboard clears after {CLIPBOARD_SECONDS} seconds if unchanged."
+                message = entry_actions(database, session, selected_entry)
+                entries = list_entries(database, session)
             except ValueError as error:
                 message = str(error)
         else:
             message = "Choose a row number shown on this page, N, P, or B."
+
+
+def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -> str:
+    """Offer actions using display data only; never retain a decrypted password."""
+    while True:
+        clear_console()
+        print(f"Service: {entry['service']}\nUsername/email: {entry['username']}")
+        print("\n1. Copy password\n2. Edit entry\n3. Delete entry\n4. Back")
+        choice = session.read_input("Choice: ").strip()
+        if choice == "1":
+            copy_entry_password(database, session, entry["id"])
+            return f"Password copied. Clipboard clears after {CLIPBOARD_SECONDS} seconds if unchanged."
+        if choice == "2":
+            prompt_edit_entry(database, session, entry)
+            return "Entry updated."
+        if choice == "3":
+            confirmation = session.read_input("Delete this entry? Type DELETE to confirm: ")
+            if confirmation != "DELETE":
+                return "Deletion cancelled."
+            delete_entry(database, session, entry["id"])
+            return "Entry deleted."
+        if choice == "4":
+            return ""
+        print("Choose 1, 2, 3, or 4.")
+
+
+def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dict):
+    """Keep blank display fields and replace passwords only by explicit choice."""
+    service = session.read_input("Service (Enter to keep): ") or entry["service"]
+    validate_entry_field(service, "Service")
+    username = session.read_input("Username/email (Enter to keep): ") or entry["username"]
+    validate_entry_field(username, "Entry username")
+    replace = session.read_input("Replace password? [y/N]: ").strip().lower()
+    if replace not in ("", "n", "y"):
+        raise ValueError("Choose Y or N. Entry was not changed.")
+    password = session.read_input("New entry password: ", hidden=True) if replace == "y" else None
+    update_entry(database, session, entry["id"], service, username, password)
 
 
 # Keep plaintext input local to these short prompt functions. Returning releases
