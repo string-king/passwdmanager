@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import getpass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -26,6 +27,48 @@ KDF_MEMORY_COST = 64 * 1024  # KiB: 64 MiB of memory per derivation
 PAGE_SIZE = 10
 CLIPBOARD_SECONDS = 20
 IDLE_SECONDS = 5 * 60
+LOG_FILE = Path(__file__).resolve().parent / "logs" / "events.jsonl"
+LOGGER = logging.getLogger("passwdmanager.events")
+LOGGER.addHandler(logging.NullHandler())
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+
+
+class EventLogHandler(logging.StreamHandler):
+    def handleError(self, record):
+        # Never print logging internals or the original exception to the terminal.
+        print("Could not write the security log. Check permissions and disk space.", file=sys.stderr)
+
+
+def configure_logging(path: Path = LOG_FILE):
+    """Open one private append-only JSON Lines file for this process."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "a", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    handler = EventLogHandler(stream)
+    LOGGER.addHandler(handler)
+    return handler
+
+
+def log_event(event: str, *, user_id: int | None = None,
+              operation: str | None = None, reason: str | None = None):
+    """Accept only explicit audit fields; callers never pass credential contents."""
+    level = logging.WARNING if event in ("login_failed", "integrity_check_failed", "operation_failed") else logging.INFO
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(),
+              "severity": logging.getLevelName(level), "event": event}
+    if user_id is not None:
+        record["user_id"] = user_id
+    if operation is not None:
+        record["operation"] = operation
+    if reason is not None:
+        record["reason"] = reason
+    LOGGER.log(level, json.dumps(record))
 
 
 class SessionExpired(Exception):
@@ -35,8 +78,9 @@ class SessionExpired(Exception):
 class Clipboard:
     """Track our last copy without retaining another plaintext password."""
 
-    def __init__(self):
+    def __init__(self, owner_id: int | None = None):
         """Initialize clipboard tracking and synchronization for the timer."""
+        self.owner_id = owner_id
         self.digest = None
         self.timer = None
         self.mutex = threading.Lock()
@@ -54,6 +98,7 @@ class Clipboard:
                     check=True, timeout=3,
                 )
             except (OSError, subprocess.SubprocessError):
+                log_event("operation_failed", user_id=self.owner_id, operation="clipboard_copy")
                 raise ValueError("Could not copy the password. Clear the clipboard manually if needed.") from None
             if self.timer is not None:
                 self.timer.cancel()
@@ -88,6 +133,7 @@ class Clipboard:
                         check=True, timeout=3,
                     )
             except (OSError, subprocess.SubprocessError):
+                log_event("operation_failed", user_id=self.owner_id, operation="clipboard_clear")
                 self.warning = "Could not clear the clipboard. Clear it manually."
                 return
             self.digest = None
@@ -101,7 +147,7 @@ class Session:
         """Start an unlocked session with its own clipboard tracker."""
         self.owner_id = owner_id
         self.cipher = cipher
-        self.clipboard = Clipboard()
+        self.clipboard = Clipboard(owner_id)
         self.deadline = time.monotonic() + IDLE_SECONDS
 
     def require_unlocked(self):
@@ -109,7 +155,7 @@ class Session:
         if self.cipher is None:
             raise ValueError("Vault is locked. Log in again.")
         if time.monotonic() >= self.deadline:
-            self.lock()
+            self.lock(reason="inactivity")
             raise SessionExpired("Vault locked after five minutes of inactivity.")
 
     def read_input(self, prompt: str, *, hidden=False) -> str:
@@ -137,11 +183,14 @@ class Session:
         self.deadline = time.monotonic() + IDLE_SECONDS
         return value
 
-    def lock(self):
+    def lock(self, reason: str = "logout"):
         """Drop the encryption object and attempt to clear our clipboard copy."""
         # Release the encryption object; this does not guarantee memory erasure.
+        was_unlocked = self.cipher is not None
         self.cipher = None
         self.clipboard.clear()
+        if was_unlocked:
+            log_event("vault_locked", user_id=self.owner_id, reason=reason)
 
 
 def open_database(path: Path = DATABASE) -> sqlite3.Connection:
@@ -246,7 +295,7 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
     try:
         # Commit the complete account on success, or roll back if saving fails.
         with database:
-            database.execute(
+            result = database.execute(
                 """INSERT INTO users
                    (username, verification_salt, verifier, key_salt,
                     iterations, lanes, memory_cost) VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -255,6 +304,7 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
             )
     except sqlite3.IntegrityError:
         raise ValueError("Username is already taken.") from None
+    log_event("account_created", user_id=result.lastrowid)
 
 
 def login_account(database: sqlite3.Connection, username: str, password: str) -> Session:
@@ -264,19 +314,23 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
         validate_account_username(username)
         validate_password(password, "Master password")
     except ValueError:
+        log_event("login_failed")
         raise ValueError(failure) from None
 
     user = database.execute(
         "SELECT * FROM users WHERE username = ?", (username,)
     ).fetchone()
     if user is None:
+        log_event("login_failed")
         raise ValueError(failure)
 
     # Treat the database as untrusted: do not accept arbitrary Argon2 costs.
     settings = (user["iterations"], user["lanes"], user["memory_cost"])
     if settings != (KDF_ITERATIONS, KDF_LANES, KDF_MEMORY_COST):
+        log_event("login_failed")
         raise ValueError("Unsupported account key-derivation settings.")
     if not isinstance(user["verifier"], bytes) or len(user["verifier"]) != 32:
+        log_event("login_failed")
         raise ValueError("Invalid account metadata.")
 
     try:
@@ -284,11 +338,14 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
             password.encode("utf-8"), user["verifier"]
         )
     except InvalidKey:
+        log_event("login_failed")
         raise ValueError(failure) from None
 
     # Derive the vault key only after verification, using the independent salt.
     key = password_kdf(user["key_salt"]).derive(password.encode("utf-8"))
-    return Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+    session = Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+    log_event("login_succeeded", user_id=user["id"])
+    return session
 
 
 def validate_entry_field(value: str, label: str):
@@ -324,6 +381,7 @@ def add_entry(
             "INSERT INTO entries (id, owner_id, payload) VALUES (?, ?, ?)",
             (entry_id, session.owner_id, payload),
         )
+    log_event("entry_created", user_id=session.owner_id)
     return entry_id
 
 
@@ -350,6 +408,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
             updated_at = updated_at.astimezone(timezone.utc)
         entry["updated_at"] = updated_at
     except (InvalidToken, ValueError, TypeError, KeyError, OverflowError):
+        log_event("integrity_check_failed", user_id=session.owner_id)
         raise ValueError("Entry integrity check failed. Vault data may be damaged.") from None
     return entry
 
@@ -371,6 +430,7 @@ def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id
     """Re-read an owned entry and copy its password without printing."""
     entry = load_entry(database, session, entry_id)
     session.clipboard.copy(entry["password"])
+    log_event("password_copied", user_id=session.owner_id)
 
 
 def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
@@ -395,6 +455,8 @@ def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
         if result.rowcount != 1:
             raise ValueError("Entry not found in your vault.")
 
+    log_event("entry_updated", user_id=session.owner_id)
+
 
 def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
     """Delete only the authenticated user's selected record."""
@@ -407,6 +469,8 @@ def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
         )
         if result.rowcount != 1:
             raise ValueError("Entry not found in your vault.")
+
+    log_event("entry_deleted", user_id=session.owner_id)
 
 
 def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
@@ -582,6 +646,7 @@ def prompt_add_entry(database: sqlite3.Connection, session: Session):
 
 def run_vault(database: sqlite3.Connection, session: Session) -> bool:
     """Run the vault menu; return True to exit or False to log out. Always lock."""
+    lock_reason = "error"
     try:
         clear_console()
         print("Vault unlocked.")
@@ -609,18 +674,28 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
                 except ValueError as error:
                     print(error)
             elif choice == "3":
+                lock_reason = "logout"
                 return False
             elif choice == "4":
+                lock_reason = "exit"
                 return True
             else:
                 print("Choose 1, 2, 3, or 4.")
     except SessionExpired as error:
+        lock_reason = "inactivity"
         clear_console()
         print(error)
         return False
+    except (OSError, sqlite3.Error):
+        log_event("operation_failed", user_id=session.owner_id, operation="database")
+        print("Unable to access the vault database. Check permissions and disk space.")
+        return False
+    except (EOFError, KeyboardInterrupt):
+        lock_reason = "interrupted"
+        raise
     finally:
         # Also lock when Ctrl-C, EOF, or an unexpected error interrupts the menu.
-        session.lock()
+        session.lock(reason=lock_reason)
         if session.clipboard.warning:
             print(session.clipboard.warning)
         print("Vault locked.")
@@ -666,6 +741,12 @@ def main() -> int:
         print("Run this application in an interactive terminal.")
         return 1
 
+    try:
+        log_handler = configure_logging()
+    except OSError:
+        print("Unable to open the security log. Check permissions and disk space.")
+        return 1
+
     database = None
     try:
         database = open_database()
@@ -673,6 +754,7 @@ def main() -> int:
     except (EOFError, KeyboardInterrupt):
         print("\nExiting.")
     except (OSError, sqlite3.Error):
+        log_event("operation_failed", operation="database")
         print("Unable to access the vault database. Check permissions and disk space.")
         return 1
     except getpass.GetPassWarning:
@@ -684,6 +766,9 @@ def main() -> int:
     finally:
         if database is not None:
             database.close()
+        LOGGER.removeHandler(log_handler)
+        log_handler.stream.close()
+        log_handler.close()
     return 0
 
 
