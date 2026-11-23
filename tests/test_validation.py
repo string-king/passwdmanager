@@ -28,6 +28,8 @@ class ValidationTests(unittest.TestCase):
             pm.interrupt_exit(pm.signal.SIGTSTP, None)
         with patch.object(pm.sys.stdin, "isatty", return_value=True), \
                 patch.object(pm.sys.stdout, "isatty", return_value=True), \
+                patch.object(pm.termios, "tcgetattr", return_value=[0, 0, 0, 0, 0, 0, []]), \
+                patch.object(pm.termios, "tcsetattr"), \
                 patch.object(pm, "configure_logging", return_value=handler), \
                 patch.object(pm, "open_database", return_value=database), \
                 patch.object(pm, "run", side_effect=interrupted_run), patch("builtins.print"):

@@ -1,4 +1,5 @@
 import base64
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -12,6 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
+import termios
 import time
 import uuid
 import warnings
@@ -848,8 +850,30 @@ def run(database: sqlite3.Connection):
 
 
 def interrupt_exit(signum, frame):
-    """Turn terminal suspension into orderly exit so secrets are not suspended."""
+    """Use orderly exit for terminal quit and suspension requests."""
     raise KeyboardInterrupt
+
+
+@contextmanager
+def terminal_mode():
+    """Disable flow control and restore terminal settings and handlers on exit."""
+    descriptor = sys.stdin.fileno()
+    original = termios.tcgetattr(descriptor)
+    settings = original[:]
+    settings[0] &= ~(termios.IXON | termios.IXOFF)
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGTSTP, signal.SIGQUIT):
+            previous_handlers[signum] = signal.signal(signum, interrupt_exit)
+        termios.tcsetattr(descriptor, termios.TCSANOW, settings)
+        yield
+    finally:
+        try:
+            # Discard unfinished input and restore echo even after interrupted getpass.
+            termios.tcsetattr(descriptor, termios.TCSAFLUSH, original)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def main() -> int:
@@ -859,12 +883,24 @@ def main() -> int:
         return 1
 
     try:
+        with terminal_mode():
+            return run_application()
+    except termios.error:
+        print("Unable to configure or restore terminal settings.", file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("\nExiting.")
+        return 0
+
+
+def run_application() -> int:
+    """Manage logging and database resources inside the terminal context."""
+    try:
         log_handler = configure_logging()
     except OSError:
         print("Unable to open the security log. Check permissions and disk space.")
         return 1
 
-    previous_suspend_handler = signal.signal(signal.SIGTSTP, interrupt_exit)
     database = None
     try:
         database = open_database()
@@ -882,7 +918,6 @@ def main() -> int:
         print("This cryptography installation does not support Argon2id.")
         return 1
     finally:
-        signal.signal(signal.SIGTSTP, previous_suspend_handler)
         if database is not None:
             database.close()
         LOGGER.removeHandler(log_handler)
