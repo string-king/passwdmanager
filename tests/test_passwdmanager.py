@@ -199,7 +199,7 @@ class VaultTests(unittest.TestCase):
             nonlocal contents
             self.assertEqual(pm.signal.getitimer(pm.signal.ITIMER_REAL), (0.0, 0.0))
             if command[0] == "/usr/bin/pbcopy":
-                contents = kwargs["input"]
+                contents = bytes(kwargs["input"])
                 # Simulate crossing the idle deadline while pbcopy is running.
                 self.alice.deadline = pm.time.monotonic() - 1
             return subprocess.CompletedProcess(command, 0, stdout=contents, stderr=b"")
@@ -385,7 +385,7 @@ class ClipboardTests(unittest.TestCase):
 
     def run_clipboard(self, command, **kwargs):
         if command[0] == "/usr/bin/pbcopy":
-            self.contents = kwargs["input"]
+            self.contents = bytes(kwargs["input"])
         return subprocess.CompletedProcess(command, 0, stdout=self.contents, stderr=b"")
 
     def test_copy_schedules_clear_and_keeps_no_plaintext_attribute(self):

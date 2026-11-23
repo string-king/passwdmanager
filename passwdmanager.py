@@ -71,6 +71,11 @@ def log_event(event: str, *, user_id: int | None = None,
     LOGGER.log(level, json.dumps(record))
 
 
+def wipe_buffer(buffer: bytearray):
+    """Overwrite this buffer only; immutable and library-owned copies may remain."""
+    buffer[:] = b"\x00" * len(buffer)
+
+
 class SessionExpired(Exception):
     """Interrupt an idle vault, including a blocked terminal prompt."""
 
@@ -89,25 +94,30 @@ class Clipboard:
 
     def copy(self, password: str):
         """Copy a password to macOS and schedule conditional clearing."""
-        data = password.encode("utf-8")
-        with self.mutex:
-            try:
-                subprocess.run(
-                    ["/usr/bin/pbcopy"], input=data, capture_output=True,
-                    env={**os.environ, "LC_ALL": "en_US.UTF-8"},
-                    check=True, timeout=3,
-                )
-            except (OSError, subprocess.SubprocessError):
-                log_event("operation_failed", user_id=self.owner_id, operation="clipboard_copy")
-                raise ValueError("Could not copy the password. Clear the clipboard manually if needed.") from None
-            if self.timer is not None:
-                self.timer.cancel()
-            self.digest = hashlib.sha256(data).digest()
-            self.warning = ""
-            self.generation += 1
-            self.timer = threading.Timer(CLIPBOARD_SECONDS, self.clear, args=(self.generation,))
-            self.timer.daemon = True
-            self.timer.start()
+        data = bytearray(password, "utf-8")
+        password = None
+        try:
+            with self.mutex:
+                try:
+                    subprocess.run(
+                        ["/usr/bin/pbcopy"], input=data, capture_output=True,
+                        env={**os.environ, "LC_ALL": "en_US.UTF-8"},
+                        check=True, timeout=3,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    log_event("operation_failed", user_id=self.owner_id, operation="clipboard_copy")
+                    raise ValueError("Could not copy the password. Clear the clipboard manually if needed.") from None
+                if self.timer is not None:
+                    self.timer.cancel()
+                self.digest = hashlib.sha256(data).digest()
+                self.warning = ""
+                self.generation += 1
+                self.timer = threading.Timer(CLIPBOARD_SECONDS, self.clear, args=(self.generation,))
+                self.timer.daemon = True
+                self.timer.start()
+
+        finally:
+            wipe_buffer(data)
 
     def clear(self, generation=None):
         """Clear our copied password if unchanged, ignoring outdated timers."""
@@ -290,7 +300,12 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
     verification_salt = os.urandom(16)
     # The encryption key will use its own salt, separate from password checking.
     key_salt = os.urandom(16)
-    verifier = password_kdf(verification_salt).derive(password.encode("utf-8"))
+    password_bytes = bytearray(password, "utf-8")
+    password = None
+    try:
+        verifier = password_kdf(verification_salt).derive(password_bytes)
+    finally:
+        wipe_buffer(password_bytes)
 
     try:
         # Commit the complete account on success, or roll back if saving fails.
@@ -333,17 +348,23 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
         log_event("login_failed")
         raise ValueError("Invalid account metadata.")
 
+    password_bytes = bytearray(password, "utf-8")
+    password = None
+    key = None
     try:
-        password_kdf(user["verification_salt"]).verify(
-            password.encode("utf-8"), user["verifier"]
-        )
-    except InvalidKey:
-        log_event("login_failed")
-        raise ValueError(failure) from None
+        try:
+            password_kdf(user["verification_salt"]).verify(password_bytes, user["verifier"])
+        except InvalidKey:
+            log_event("login_failed")
+            raise ValueError(failure) from None
 
-    # Derive the vault key only after verification, using the independent salt.
-    key = password_kdf(user["key_salt"]).derive(password.encode("utf-8"))
-    session = Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+        # Reuse the same input buffer; the returned key and Fernet internals are immutable.
+        key = password_kdf(user["key_salt"]).derive(password_bytes)
+        session = Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+    finally:
+        wipe_buffer(password_bytes)
+        key = None
+
     log_event("login_succeeded", user_id=user["id"])
     return session
 
@@ -375,7 +396,12 @@ def add_entry(
     }
     # Encrypt all credential fields together. Only ciphertext reaches SQLite.
     # Encrypted IDs will let us detect payloads moved to another record on read.
-    payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    try:
+        payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    finally:
+        # Release plaintext field references before database I/O, even on failure.
+        entry.clear()
+        password = None
     with database:
         database.execute(
             "INSERT INTO entries (id, owner_id, payload) VALUES (?, ?, ?)",
@@ -388,6 +414,7 @@ def add_entry(
 def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
     """Shared integrity checks for listing and password retrieval."""
     session.require_unlocked()
+    entry = None
     try:
         entry = json.loads(session.cipher.decrypt(row["payload"]))
         if not isinstance(entry, dict):
@@ -408,6 +435,8 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
             updated_at = updated_at.astimezone(timezone.utc)
         entry["updated_at"] = updated_at
     except (InvalidToken, ValueError, TypeError, KeyError, OverflowError):
+        if isinstance(entry, dict):
+            entry.clear()
         log_event("integrity_check_failed", user_id=session.owner_id)
         raise ValueError("Entry integrity check failed. Vault data may be damaged.") from None
     return entry
@@ -429,23 +458,33 @@ def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) ->
 def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id: str):
     """Re-read an owned entry and copy its password without printing."""
     entry = load_entry(database, session, entry_id)
-    session.clipboard.copy(entry["password"])
+    try:
+        session.clipboard.copy(entry["password"])
+    finally:
+        entry.clear()
     log_event("password_copied", user_id=session.owner_id)
 
 
 def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
                  service: str, username: str, password: str | None = None):
     """Update an owned entry; None preserves the existing password."""
-    entry = load_entry(database, session, entry_id)
+    session.require_unlocked()
     validate_entry_field(service, "Service")
     validate_entry_field(username, "Entry username")
     if password is not None:
         validate_password(password, "Entry password")
+    entry = load_entry(database, session, entry_id)
+    if password is not None:
         entry["password"] = password
     entry["service"] = service
     entry["username"] = username
     entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-    payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    try:
+        payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
+    finally:
+        # Release plaintext field references before database I/O, even on failure.
+        entry.clear()
+        password = None
     session.require_unlocked()
     with database:
         result = database.execute(
@@ -484,13 +523,16 @@ def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
     for row in rows:
         entry = decrypt_entry(session, row)
 
-        # Return only display data so the interface never receives the password.
-        summaries.append({
-            "id": row["id"],
-            "service": entry["service"],
-            "username": entry["username"],
-            "updated_at": entry["updated_at"],
-        })
+        try:
+            # Return only display data so the interface never receives the password.
+            summaries.append({
+                "id": row["id"],
+                "service": entry["service"],
+                "username": entry["username"],
+                "updated_at": entry["updated_at"],
+            })
+        finally:
+            entry.clear()
     # Entries without a known time appear last. Equal times retain their order.
     oldest = datetime.min.replace(tzinfo=timezone.utc)
     return sorted(summaries, key=lambda entry: entry["updated_at"] or oldest, reverse=True)
@@ -610,7 +652,10 @@ def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dic
     if replace not in ("", "n", "y"):
         raise ValueError("Choose Y or N. Entry was not changed.")
     password = session.read_input("New entry password: ", hidden=True) if replace == "y" else None
-    update_entry(database, session, entry["id"], service, username, password)
+    try:
+        update_entry(database, session, entry["id"], service, username, password)
+    finally:
+        password = None
 
 
 # Keep plaintext input local to these short prompt functions. Returning releases
@@ -620,18 +665,27 @@ def prompt_registration(database: sqlite3.Connection):
     username = input("Username: ")
     print("Master password must contain 12 to 1024 characters.")
     password = read_password("Master password: ")
-    validate_master_password(password)
-    confirmation = read_password("Confirm master password: ")
-    if password != confirmation:
-        raise ValueError("Passwords do not match.")
-    register_account(database, username, password)
+    confirmation = None
+    try:
+        validate_master_password(password)
+        confirmation = read_password("Confirm master password: ")
+        if password != confirmation:
+            raise ValueError("Passwords do not match.")
+        confirmation = None
+        register_account(database, username, password)
+    finally:
+        password = None
+        confirmation = None
 
 
 def prompt_login(database: sqlite3.Connection) -> Session:
     """Collect hidden login credentials and return the authenticated session."""
     username = input("Username: ")
     password = read_password("Master password: ")
-    return login_account(database, username, password)
+    try:
+        return login_account(database, username, password)
+    finally:
+        password = None
 
 
 def prompt_add_entry(database: sqlite3.Connection, session: Session):
@@ -641,7 +695,10 @@ def prompt_add_entry(database: sqlite3.Connection, session: Session):
     username = session.read_input("Username/email: ")
     validate_entry_field(username, "Entry username")
     password = session.read_input("Entry password: ", hidden=True)
-    add_entry(database, session, service, username, password)
+    try:
+        add_entry(database, session, service, username, password)
+    finally:
+        password = None
 
 
 def run_vault(database: sqlite3.Connection, session: Session) -> bool:
