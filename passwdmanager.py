@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import signal
 import subprocess
 import sys
@@ -27,6 +28,7 @@ KDF_MEMORY_COST = 64 * 1024  # KiB: 64 MiB of memory per derivation
 PAGE_SIZE = 10
 CLIPBOARD_SECONDS = 20
 IDLE_SECONDS = 5 * 60
+MAX_PAYLOAD_BYTES = 64 * 1024
 LOG_FILE = Path(__file__).resolve().parent / "logs" / "events.jsonl"
 LOGGER = logging.getLogger("passwdmanager.events")
 LOGGER.addHandler(logging.NullHandler())
@@ -40,13 +42,32 @@ class EventLogHandler(logging.StreamHandler):
         print("Could not write the security log. Check permissions and disk space.", file=sys.stderr)
 
 
+def private_directory(path: Path):
+    """Reject symlinked application directories before changing permissions."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise OSError("Unsafe application directory.")
+    path.chmod(0o700)
+
+
+def open_private_file(path: Path, flags: int) -> int:
+    """Open a regular private file; nonblocking mode prevents FIFO hangs."""
+    private_directory(path.parent)
+    descriptor = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("Expected a regular file.")
+        os.fchmod(descriptor, 0o600)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def configure_logging(path: Path = LOG_FILE):
     """Open one private append-only JSON Lines file for this process."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    descriptor = open_private_file(path, os.O_APPEND | os.O_WRONLY)
     try:
-        os.fchmod(descriptor, 0o600)
         stream = os.fdopen(descriptor, "a", encoding="utf-8")
     except BaseException:
         os.close(descriptor)
@@ -155,6 +176,7 @@ class Session:
 
     def __init__(self, owner_id: int, cipher: Fernet):
         """Start an unlocked session with its own clipboard tracker."""
+        validate_owner_id(owner_id)
         self.owner_id = owner_id
         self.cipher = cipher
         self.clipboard = Clipboard(owner_id)
@@ -205,15 +227,8 @@ class Session:
 
 def open_database(path: Path = DATABASE) -> sqlite3.Connection:
     """Open a private SQLite file and create any missing account/vault tables."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-    # Create the file privately before SQLite writes anything to it.
-    # Reject symbolic links so we cannot change permissions on another file.
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        os.fchmod(descriptor, 0o600)
-    finally:
-        os.close(descriptor)
+    descriptor = open_private_file(path, os.O_RDWR)
+    os.close(descriptor)
 
     database = sqlite3.connect(path)
     database.row_factory = sqlite3.Row
@@ -272,11 +287,37 @@ def validate_password(password: str, label: str, minimum: int = 1):
     """Apply the same password type and length rules at every boundary."""
     if not isinstance(password, str) or not minimum <= len(password) <= 1024:
         raise ValueError(f"{label} must contain {minimum} to 1024 characters.")
+    try:
+        password.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{label} contains invalid Unicode.") from None
 
 
 def validate_master_password(password: str):
     """Reject a new master password outside the allowed length range."""
     validate_password(password, "Master password", minimum=12)
+
+
+def validate_entry_id(entry_id: str):
+    if not isinstance(entry_id, str) or len(entry_id) != 32 or any(
+        character not in "0123456789abcdef" for character in entry_id
+    ):
+        raise ValueError("Entry not found in your vault.")
+
+
+def validate_owner_id(owner_id: int):
+    if type(owner_id) is not int or not 1 <= owner_id <= 2**63 - 1:
+        raise ValueError("Invalid account metadata.")
+
+
+def unique_json_fields(pairs):
+    """Reject ambiguous JSON objects instead of silently keeping the last field."""
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("Duplicate JSON field.")
+        result[name] = value
+    return result
 
 
 def password_kdf(salt: bytes) -> Argon2id:
@@ -341,12 +382,21 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
 
     # Treat the database as untrusted: do not accept arbitrary Argon2 costs.
     settings = (user["iterations"], user["lanes"], user["memory_cost"])
-    if settings != (KDF_ITERATIONS, KDF_LANES, KDF_MEMORY_COST):
+    if any(type(value) is not int for value in settings) or settings != (KDF_ITERATIONS, KDF_LANES, KDF_MEMORY_COST):
         log_event("login_failed")
         raise ValueError("Unsupported account key-derivation settings.")
     if not isinstance(user["verifier"], bytes) or len(user["verifier"]) != 32:
         log_event("login_failed")
         raise ValueError("Invalid account metadata.")
+
+    try:
+        validate_owner_id(user["id"])
+        for salt in (user["verification_salt"], user["key_salt"]):
+            if not isinstance(salt, bytes) or len(salt) != 16:
+                raise ValueError("Invalid account metadata.")
+    except ValueError:
+        log_event("login_failed")
+        raise
 
     password_bytes = bytearray(password, "utf-8")
     password = None
@@ -416,13 +466,18 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
     session.require_unlocked()
     entry = None
     try:
-        entry = json.loads(session.cipher.decrypt(row["payload"]))
+        validate_entry_id(row["id"])
+        payload = row["payload"]
+        if not isinstance(payload, bytes) or not 1 <= len(payload) <= MAX_PAYLOAD_BYTES:
+            raise ValueError
+        entry = json.loads(session.cipher.decrypt(payload), object_pairs_hook=unique_json_fields)
         if not isinstance(entry, dict):
             raise ValueError
         # A valid encrypted payload must belong to this exact row and user.
         if entry["id"] != row["id"] or entry["owner_id"] != session.owner_id:
             raise ValueError
-        validate_entry_field(entry["id"], "Entry ID")
+        validate_entry_id(entry["id"])
+        validate_owner_id(entry["owner_id"])
         validate_entry_field(entry["service"], "Service")
         validate_entry_field(entry["username"], "Entry username")
         validate_password(entry["password"], "Entry password")
@@ -434,7 +489,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
                 raise ValueError
             updated_at = updated_at.astimezone(timezone.utc)
         entry["updated_at"] = updated_at
-    except (InvalidToken, ValueError, TypeError, KeyError, OverflowError):
+    except (InvalidToken, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         if isinstance(entry, dict):
             entry.clear()
         log_event("integrity_check_failed", user_id=session.owner_id)
@@ -445,7 +500,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
 def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) -> dict:
     """Load and verify one owned record; callers must keep plaintext short-lived."""
     session.require_unlocked()
-    validate_entry_field(entry_id, "Entry ID")
+    validate_entry_id(entry_id)
     row = database.execute(
         "SELECT id, payload FROM entries WHERE id = ? AND owner_id = ?",
         (entry_id, session.owner_id),
@@ -500,7 +555,7 @@ def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
 def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
     """Delete only the authenticated user's selected record."""
     session.require_unlocked()
-    validate_entry_field(entry_id, "Entry ID")
+    validate_entry_id(entry_id)
     with database:
         result = database.execute(
             "DELETE FROM entries WHERE id = ? AND owner_id = ?",
@@ -792,6 +847,11 @@ def run(database: sqlite3.Connection):
             print("Choose 1, 2, or 3.")
 
 
+def interrupt_exit(signum, frame):
+    """Turn terminal suspension into orderly exit so secrets are not suspended."""
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     """Check terminal support, manage the database lifetime, and report failures."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -804,6 +864,7 @@ def main() -> int:
         print("Unable to open the security log. Check permissions and disk space.")
         return 1
 
+    previous_suspend_handler = signal.signal(signal.SIGTSTP, interrupt_exit)
     database = None
     try:
         database = open_database()
@@ -821,6 +882,7 @@ def main() -> int:
         print("This cryptography installation does not support Argon2id.")
         return 1
     finally:
+        signal.signal(signal.SIGTSTP, previous_suspend_handler)
         if database is not None:
             database.close()
         LOGGER.removeHandler(log_handler)
