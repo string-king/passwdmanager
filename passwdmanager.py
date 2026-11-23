@@ -31,6 +31,9 @@ PAGE_SIZE = 10
 CLIPBOARD_SECONDS = 20
 IDLE_SECONDS = 5 * 60
 MAX_PAYLOAD_BYTES = 64 * 1024
+ENTRY_NOT_FOUND = "Entry not found in your vault."
+INVALID_ACCOUNT_METADATA = "Invalid account metadata."
+INACTIVITY_MESSAGE = "Vault locked after five minutes of inactivity."
 LOG_FILE = Path(__file__).resolve().parent / "logs" / "events.jsonl"
 LOGGER = logging.getLogger("passwdmanager.events")
 LOGGER.addHandler(logging.NullHandler())
@@ -190,14 +193,14 @@ class Session:
             raise ValueError("Vault is locked. Log in again.")
         if time.monotonic() >= self.deadline:
             self.lock(reason="inactivity")
-            raise SessionExpired("Vault locked after five minutes of inactivity.")
+            raise SessionExpired(INACTIVITY_MESSAGE)
 
     def read_input(self, prompt: str, *, hidden=False) -> str:
         """Interrupt only terminal input; never interrupt a vault write or copy."""
         self.require_unlocked()
 
         def expire(signum, frame):
-            raise SessionExpired("Vault locked after five minutes of inactivity.")
+            raise SessionExpired(INACTIVITY_MESSAGE)
 
         previous_handler = signal.getsignal(signal.SIGALRM)
         if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
@@ -206,7 +209,7 @@ class Session:
         try:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
-                raise SessionExpired("Vault locked after five minutes of inactivity.")
+                raise SessionExpired(INACTIVITY_MESSAGE)
             signal.setitimer(signal.ITIMER_REAL, remaining)
             value = read_password(prompt) if hidden else input(prompt)
         finally:
@@ -304,12 +307,12 @@ def validate_entry_id(entry_id: str):
     if not isinstance(entry_id, str) or len(entry_id) != 32 or any(
         character not in "0123456789abcdef" for character in entry_id
     ):
-        raise ValueError("Entry not found in your vault.")
+        raise ValueError(ENTRY_NOT_FOUND)
 
 
 def validate_owner_id(owner_id: int):
     if type(owner_id) is not int or not 1 <= owner_id <= 2**63 - 1:
-        raise ValueError("Invalid account metadata.")
+        raise ValueError(INVALID_ACCOUNT_METADATA)
 
 
 def unique_json_fields(pairs):
@@ -325,7 +328,7 @@ def unique_json_fields(pairs):
 def password_kdf(salt: bytes) -> Argon2id:
     """Build a fresh Argon2id object using the application's fixed settings."""
     if not isinstance(salt, bytes) or len(salt) != 16:
-        raise ValueError("Invalid account metadata.")
+        raise ValueError(INVALID_ACCOUNT_METADATA)
     return Argon2id(
         salt=salt,
         length=32,
@@ -389,13 +392,13 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
         raise ValueError("Unsupported account key-derivation settings.")
     if not isinstance(user["verifier"], bytes) or len(user["verifier"]) != 32:
         log_event("login_failed")
-        raise ValueError("Invalid account metadata.")
+        raise ValueError(INVALID_ACCOUNT_METADATA)
 
     try:
         validate_owner_id(user["id"])
         for salt in (user["verification_salt"], user["key_salt"]):
             if not isinstance(salt, bytes) or len(salt) != 16:
-                raise ValueError("Invalid account metadata.")
+                raise ValueError(INVALID_ACCOUNT_METADATA)
     except ValueError:
         log_event("login_failed")
         raise
@@ -508,7 +511,7 @@ def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) ->
         (entry_id, session.owner_id),
     ).fetchone()
     if row is None:
-        raise ValueError("Entry not found in your vault.")
+        raise ValueError(ENTRY_NOT_FOUND)
     return decrypt_entry(session, row)
 
 
@@ -549,7 +552,7 @@ def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
             (payload, entry_id, session.owner_id),
         )
         if result.rowcount != 1:
-            raise ValueError("Entry not found in your vault.")
+            raise ValueError(ENTRY_NOT_FOUND)
 
     log_event("entry_updated", user_id=session.owner_id)
 
@@ -564,7 +567,7 @@ def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
             (entry_id, session.owner_id),
         )
         if result.rowcount != 1:
-            raise ValueError("Entry not found in your vault.")
+            raise ValueError(ENTRY_NOT_FOUND)
 
     log_event("entry_deleted", user_id=session.owner_id)
 
@@ -626,6 +629,24 @@ def print_entries(entries: list[dict]):
         print(" | ".join(value.ljust(width) for value, width in zip(row, widths)))
 
 
+def print_entry_page(entries: list[dict], page: int, page_count: int,
+                     message: str, clipboard_warning: str):
+    """Render one page and its status messages without changing navigation."""
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(entries))
+    clear_console()
+    print(f"Page {page + 1} of {page_count} | {len(entries)} entries")
+    if entries:
+        print(f"Showing {start + 1}-{end}, newest first.\n")
+    print_entries(entries[start:end])
+    if message:
+        print(f"\n{message}")
+    if clipboard_warning:
+        print(clipboard_warning)
+    print("\n[N] Next  [P] Previous  [B] Back")
+    print("Enter a row number for entry actions.")
+
+
 def browse_entries(database: sqlite3.Connection, session: Session, entries: list[dict]):
     """Browse display fields and open actions for the selected row."""
     page = 0
@@ -633,46 +654,30 @@ def browse_entries(database: sqlite3.Connection, session: Session, entries: list
     while True:
         page_count = max(1, (len(entries) + PAGE_SIZE - 1) // PAGE_SIZE)
         page = min(page, page_count - 1)
-        clear_console()
         start = page * PAGE_SIZE
-        end = min(start + PAGE_SIZE, len(entries))
-        page_entries = entries[start:end]
+        page_entries = entries[start:start + PAGE_SIZE]
         row_numbers = [str(number) for number in range(1, len(page_entries) + 1)]
-        print(f"Page {page + 1} of {page_count} | {len(entries)} entries")
-        if entries:
-            print(f"Showing {start + 1}-{end}, newest first.\n")
-        print_entries(page_entries)
-        if message:
-            print(f"\n{message}")
-        if session.clipboard.warning:
-            print(session.clipboard.warning)
-
-        print("\n[N] Next  [P] Previous  [B] Back")
-        print("Enter a row number for entry actions.")
+        print_entry_page(entries, page, page_count, message, session.clipboard.warning)
         choice = session.read_input("Choice: ").strip().lower()
         message = ""
-        if choice == "n":
-            if page + 1 < page_count:
-                page += 1
-            else:
-                message = "Already on the last page."
-        elif choice == "p":
-            if page > 0:
-                page -= 1
-            else:
-                message = "Already on the first page."
-        elif choice == "b":
-            clear_console()
-            return
-        elif choice in row_numbers:
-            selected_entry = page_entries[int(choice) - 1]
-            try:
+        try:
+            if choice == "n":
+                message = "Already on the last page." if page + 1 == page_count else ""
+                page = min(page + 1, page_count - 1)
+            elif choice == "p":
+                message = "Already on the first page." if page == 0 else ""
+                page = max(page - 1, 0)
+            elif choice == "b":
+                clear_console()
+                return
+            elif choice in row_numbers:
+                selected_entry = page_entries[int(choice) - 1]
                 message = entry_actions(database, session, selected_entry)
                 entries = list_entries(database, session)
-            except ValueError as error:
-                message = str(error)
-        else:
-            message = "Choose a row number shown on this page, N, P, or B."
+            else:
+                message = "Choose a row number shown on this page, N, P, or B."
+        except ValueError as error:
+            message = str(error)
 
 
 def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -> str:
@@ -773,28 +778,25 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
             print("4. Exit")
             choice = session.read_input("Choice: ")
             clear_console()
-            if choice == "1":
-                try:
+            try:
+                if choice == "1":
                     prompt_add_entry(database, session)
                     clear_console()
                     print("Entry saved.")
-                except ValueError as error:
-                    clear_console()
-                    print(error)
-            elif choice == "2":
-                try:
+                elif choice == "2":
                     entries = list_entries(database, session)
                     browse_entries(database, session, entries)
-                except ValueError as error:
-                    print(error)
-            elif choice == "3":
-                lock_reason = "logout"
-                return False
-            elif choice == "4":
-                lock_reason = "exit"
-                return True
-            else:
-                print("Choose 1, 2, 3, or 4.")
+                elif choice == "3":
+                    lock_reason = "logout"
+                    return False
+                elif choice == "4":
+                    lock_reason = "exit"
+                    return True
+                else:
+                    print("Choose 1, 2, 3, or 4.")
+            except ValueError as error:
+                clear_console()
+                print(error)
     except SessionExpired as error:
         lock_reason = "inactivity"
         clear_console()

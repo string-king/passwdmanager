@@ -330,6 +330,29 @@ class VaultTests(unittest.TestCase):
             self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Entry deleted.")
         self.assertEqual(pm.list_entries(self.database, self.alice), [])
 
+    def test_browser_preserves_page_boundaries_and_back_action(self):
+        self.add_entry()
+        entries = pm.list_entries(self.database, self.alice)
+        self.alice.clipboard.warning = ""
+        with patch.object(self.alice, "read_input", side_effect=["p", "n", "1", "4", "b"]), \
+                patch.object(pm, "clear_console"), patch("builtins.print") as printer:
+            pm.browse_entries(self.database, self.alice, entries)
+        printer.assert_any_call("\nAlready on the first page.")
+        printer.assert_any_call("\nAlready on the last page.")
+        self.alice.clipboard.copy.assert_not_called()
+
+    def test_vault_recovers_from_add_and_list_validation_errors(self):
+        self.alice.clipboard.warning = ""
+        with patch.object(self.alice, "read_input", side_effect=["1", "2", "3"]), \
+                patch.object(pm, "prompt_add_entry", side_effect=ValueError("Invalid service")), \
+                patch.object(pm, "list_entries", side_effect=ValueError("Damaged entry")), \
+                patch.object(pm, "clear_console"), patch("builtins.print") as printer:
+            self.assertFalse(pm.run_vault(self.database, self.alice))
+        self.assertTrue(any(str(call.args[0]) == "Invalid service" for call in printer.call_args_list if call.args))
+        self.assertTrue(any(str(call.args[0]) == "Damaged entry" for call in printer.call_args_list if call.args))
+        self.assertIsNone(self.alice.cipher)
+        self.alice.clipboard.clear.assert_called_once_with()
+
     def test_browser_refreshes_after_deleting_last_entry_on_page(self):
         for number in range(pm.PAGE_SIZE + 1):
             self.add_entry(service=f"Site {number}")

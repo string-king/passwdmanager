@@ -65,8 +65,9 @@ class ValidationTests(unittest.TestCase):
                    json.dumps({**self.entry, "updated_at": []})]
         for text in samples:
             with self.subTest(sample=text[:30]):
+                row = self.row(text)
                 with self.assertRaisesRegex(ValueError, "^Entry integrity check failed. Vault data may be damaged.$"):
-                    pm.decrypt_entry(self.session, self.row(text))
+                    pm.decrypt_entry(self.session, row)
 
     def test_largest_valid_unicode_entry_fits_payload_limit(self):
         entry = {**self.entry, "service": "😀" * 256, "username": "😀" * 256,
