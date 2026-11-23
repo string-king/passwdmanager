@@ -190,6 +190,49 @@ class VaultTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "locked"):
                 operation()
 
+    def test_clipboard_copy_finishes_tracking_before_expired_session_cleanup(self):
+        entry_id = self.add_entry()
+        self.alice.clipboard = pm.Clipboard()
+        contents = b""
+
+        def clipboard_command(command, **kwargs):
+            nonlocal contents
+            self.assertEqual(pm.signal.getitimer(pm.signal.ITIMER_REAL), (0.0, 0.0))
+            if command[0] == "/usr/bin/pbcopy":
+                contents = kwargs["input"]
+                # Simulate crossing the idle deadline while pbcopy is running.
+                self.alice.deadline = pm.time.monotonic() - 1
+            return subprocess.CompletedProcess(command, 0, stdout=contents, stderr=b"")
+
+        def copy_selected_entry(database, session, entries):
+            pm.copy_entry_password(database, session, entry_id)
+            self.assertEqual(contents, b"stored secret")
+            self.assertIsNotNone(session.clipboard.digest)
+
+        with patch("builtins.input", return_value="2"), patch("builtins.print"), \
+                patch.object(pm, "clear_console"), \
+                patch.object(pm, "browse_entries", side_effect=copy_selected_entry), \
+                patch.object(pm.subprocess, "run", side_effect=clipboard_command), \
+                patch.object(pm.threading, "Timer"):
+            self.assertFalse(pm.run_vault(self.database, self.alice))
+        self.assertEqual(contents, b"")
+        self.assertIsNone(self.alice.cipher)
+        self.assertIsNone(self.alice.clipboard.digest)
+
+    def test_invalid_account_and_password_types_are_rejected(self):
+        for value in [None, 12, b"password", []]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    pm.register_account(self.database, value, "valid master password")
+                with self.assertRaisesRegex(ValueError, "Invalid username or master password"):
+                    pm.login_account(self.database, value, "valid master password")
+                with self.assertRaises(ValueError):
+                    pm.validate_master_password(value)
+                with self.assertRaisesRegex(ValueError, "Invalid username or master password"):
+                    pm.login_account(self.database, "alice", value)
+                with self.assertRaises(ValueError):
+                    self.add_entry(password=value)
+
     def test_interrupted_vault_menu_always_locks(self):
         for error in [KeyboardInterrupt, EOFError, RuntimeError]:
             session = pm.Session(1, self.alice_cipher)
@@ -284,6 +327,69 @@ class ClipboardTests(unittest.TestCase):
         self.clipboard.clear()
         self.assertEqual(self.contents, b"")
         self.assertEqual(self.clipboard.warning, "")
+
+
+class InactivityTests(unittest.TestCase):
+    def make_session(self):
+        session = pm.Session(1, pm.Fernet(pm.Fernet.generate_key()))
+        session.clipboard = Mock(warning="")
+        return session
+
+    def test_exact_deadline_locks_before_record_access(self):
+        for operation in [lambda s: pm.add_entry(None, s, "site", "user", "secret"),
+                          lambda s: pm.list_entries(None, s),
+                          lambda s: pm.copy_entry_password(None, s, "id"),
+                          lambda s: pm.decrypt_entry(s, {})]:
+            session = self.make_session()
+            with patch.object(pm.time, "monotonic", return_value=session.deadline):
+                with self.assertRaises(pm.SessionExpired):
+                    operation(session)
+            self.assertIsNone(session.cipher)
+            session.clipboard.clear.assert_called_once_with()
+
+    def test_completed_input_renews_deadline(self):
+        session = self.make_session()
+        now = session.deadline - 1
+        with patch.object(pm.time, "monotonic", return_value=now), patch("builtins.input", return_value="2"):
+            self.assertEqual(session.read_input("Choice: "), "2")
+        self.assertEqual(session.deadline, now + pm.IDLE_SECONDS)
+
+    def test_input_arriving_at_deadline_cannot_revive_session(self):
+        session = self.make_session()
+        with patch.object(pm.time, "monotonic", side_effect=[session.deadline - 1, session.deadline - 1, session.deadline]), \
+                patch("builtins.input", return_value="1"):
+            with self.assertRaises(pm.SessionExpired):
+                session.read_input("Choice: ")
+        self.assertIsNone(session.cipher)
+
+    def test_menu_timeout_returns_to_login_and_restores_alarm(self):
+        session = self.make_session()
+        handler = pm.signal.getsignal(pm.signal.SIGALRM)
+        with patch("builtins.input", side_effect=pm.SessionExpired("Timed out")), \
+                patch("builtins.print"), patch.object(pm, "clear_console"):
+            self.assertFalse(pm.run_vault(None, session))
+        self.assertIsNone(session.cipher)
+        session.clipboard.clear.assert_called_once_with()
+        self.assertEqual(pm.signal.getsignal(pm.signal.SIGALRM), handler)
+        self.assertEqual(pm.signal.getitimer(pm.signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_alarm_is_active_only_during_input(self):
+        session = self.make_session()
+        def receive_input(prompt):
+            self.assertGreater(pm.signal.getitimer(pm.signal.ITIMER_REAL)[0], 0)
+            return "x"
+        with patch("builtins.input", side_effect=receive_input):
+            self.assertEqual(session.read_input("Choice: "), "x")
+        self.assertEqual(pm.signal.getitimer(pm.signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_failed_input_restores_alarm_handler(self):
+        session = self.make_session()
+        handler = pm.signal.getsignal(pm.signal.SIGALRM)
+        with patch("builtins.input", side_effect=EOFError):
+            with self.assertRaises(EOFError):
+                session.read_input("Choice: ")
+        self.assertEqual(pm.signal.getsignal(pm.signal.SIGALRM), handler)
+        self.assertEqual(pm.signal.getitimer(pm.signal.ITIMER_REAL), (0.0, 0.0))
 
 
 if __name__ == "__main__":

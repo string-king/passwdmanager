@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import warnings
 
@@ -23,6 +25,11 @@ KDF_LANES = 4
 KDF_MEMORY_COST = 64 * 1024  # KiB: 64 MiB of memory per derivation
 PAGE_SIZE = 10
 CLIPBOARD_SECONDS = 20
+IDLE_SECONDS = 5 * 60
+
+
+class SessionExpired(Exception):
+    """Interrupt an idle vault, including a blocked terminal prompt."""
 
 
 class Clipboard:
@@ -95,6 +102,40 @@ class Session:
         self.owner_id = owner_id
         self.cipher = cipher
         self.clipboard = Clipboard()
+        self.deadline = time.monotonic() + IDLE_SECONDS
+
+    def require_unlocked(self):
+        """Reject expired sessions even when called outside the terminal menu."""
+        if self.cipher is None:
+            raise ValueError("Vault is locked. Log in again.")
+        if time.monotonic() >= self.deadline:
+            self.lock()
+            raise SessionExpired("Vault locked after five minutes of inactivity.")
+
+    def read_input(self, prompt: str, *, hidden=False) -> str:
+        """Interrupt only terminal input; never interrupt a vault write or copy."""
+        self.require_unlocked()
+
+        def expire(signum, frame):
+            raise SessionExpired("Vault locked after five minutes of inactivity.")
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+            raise RuntimeError("An existing process alarm prevents safe vault timing.")
+        signal.signal(signal.SIGALRM, expire)
+        try:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise SessionExpired("Vault locked after five minutes of inactivity.")
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            value = read_password(prompt) if hidden else input(prompt)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+        self.require_unlocked()
+        self.deadline = time.monotonic() + IDLE_SECONDS
+        return value
 
     def lock(self):
         """Drop the encryption object and attempt to clear our clipboard copy."""
@@ -162,10 +203,21 @@ def clear_console():
         print("\033[2J\033[H", end="", flush=True)
 
 
+def validate_account_username(username: str):
+    """Reject empty, oversized, or unsafe account names."""
+    if not isinstance(username, str) or not username.strip() or len(username) > 64 or not username.isprintable():
+        raise ValueError("Username must contain 1 to 64 printable characters.")
+
+
+def validate_password(password: str, label: str, minimum: int = 1):
+    """Apply the same password type and length rules at every boundary."""
+    if not isinstance(password, str) or not minimum <= len(password) <= 1024:
+        raise ValueError(f"{label} must contain {minimum} to 1024 characters.")
+
+
 def validate_master_password(password: str):
     """Reject a new master password outside the allowed length range."""
-    if not 12 <= len(password) <= 1024:
-        raise ValueError("Master password must contain 12 to 1024 characters.")
+    validate_password(password, "Master password", minimum=12)
 
 
 def password_kdf(salt: bytes) -> Argon2id:
@@ -183,8 +235,7 @@ def password_kdf(salt: bytes) -> Argon2id:
 
 def register_account(database: sqlite3.Connection, username: str, password: str):
     """Save an account's password verifier, independent salts, and KDF settings."""
-    if not username.strip() or len(username) > 64 or not username.isprintable():
-        raise ValueError("Username must contain 1 to 64 printable characters.")
+    validate_account_username(username)
     validate_master_password(password)
 
     verification_salt = os.urandom(16)
@@ -209,10 +260,11 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
 def login_account(database: sqlite3.Connection, username: str, password: str) -> Session:
     """Verify credentials before deriving the account's vault encryption key."""
     failure = "Invalid username or master password."
-    if not username.strip() or len(username) > 64 or not username.isprintable():
-        raise ValueError(failure)
-    if not 1 <= len(password) <= 1024:
-        raise ValueError(failure)
+    try:
+        validate_account_username(username)
+        validate_password(password, "Master password")
+    except ValueError:
+        raise ValueError(failure) from None
 
     user = database.execute(
         "SELECT * FROM users WHERE username = ?", (username,)
@@ -250,12 +302,10 @@ def add_entry(
     service: str, username: str, password: str,
 ) -> str:
     """Encrypt a new credential for the session's owner and return its ID."""
-    if session.cipher is None:
-        raise ValueError("Vault is locked. Log in again.")
+    session.require_unlocked()
     validate_entry_field(service, "Service")
     validate_entry_field(username, "Entry username")
-    if not 1 <= len(password) <= 1024:
-        raise ValueError("Entry password must contain 1 to 1024 characters.")
+    validate_password(password, "Entry password")
 
     entry_id = uuid.uuid4().hex
     entry = {
@@ -279,8 +329,7 @@ def add_entry(
 
 def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
     """Shared integrity checks for listing and password retrieval."""
-    if session.cipher is None:
-        raise ValueError("Vault is locked. Log in again.")
+    session.require_unlocked()
     try:
         entry = json.loads(session.cipher.decrypt(row["payload"]))
         if not isinstance(entry, dict):
@@ -291,8 +340,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
         validate_entry_field(entry["id"], "Entry ID")
         validate_entry_field(entry["service"], "Service")
         validate_entry_field(entry["username"], "Entry username")
-        if not isinstance(entry["password"], str) or not 1 <= len(entry["password"]) <= 1024:
-            raise ValueError
+        validate_password(entry["password"], "Entry password")
         # Older entries have no timestamp; do not invent an update time.
         updated_at = None
         if "updated_at" in entry:
@@ -308,8 +356,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
 
 def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id: str):
     """Re-read an owned entry, verify it, and copy its password without printing."""
-    if session.cipher is None:
-        raise ValueError("Vault is locked. Log in again.")
+    session.require_unlocked()
     row = database.execute(
         "SELECT id, payload FROM entries WHERE id = ? AND owner_id = ?",
         (entry_id, session.owner_id),
@@ -322,8 +369,7 @@ def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id
 
 def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
     """Return verified display fields, newest first, without plaintext passwords."""
-    if session.cipher is None:
-        raise ValueError("Vault is locked. Log in again.")
+    session.require_unlocked()
     rows = database.execute(
         "SELECT id, payload FROM entries WHERE owner_id = ? ORDER BY rowid",
         (session.owner_id,),
@@ -397,7 +443,7 @@ def browse_entries(database: sqlite3.Connection, session: Session, entries: list
 
         print("\n[N] Next  [P] Previous  [B] Back")
         print("Enter a row number to copy its password.")
-        choice = input("Choice: ").strip().lower()
+        choice = session.read_input("Choice: ").strip().lower()
         message = ""
         if choice == "n":
             if page + 1 < page_count:
@@ -446,11 +492,11 @@ def prompt_login(database: sqlite3.Connection) -> Session:
 
 def prompt_add_entry(database: sqlite3.Connection, session: Session):
     """Validate each field as it is entered, then encrypt and save the entry."""
-    service = input("Service: ")
+    service = session.read_input("Service: ")
     validate_entry_field(service, "Service")
-    username = input("Username/email: ")
+    username = session.read_input("Username/email: ")
     validate_entry_field(username, "Entry username")
-    password = read_password("Entry password: ")
+    password = session.read_input("Entry password: ", hidden=True)
     add_entry(database, session, service, username, password)
 
 
@@ -466,7 +512,7 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
             print("2. List entries")
             print("3. Lock / log out")
             print("4. Exit")
-            choice = input("Choice: ")
+            choice = session.read_input("Choice: ")
             clear_console()
             if choice == "1":
                 try:
@@ -488,6 +534,10 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
                 return True
             else:
                 print("Choose 1, 2, 3, or 4.")
+    except SessionExpired as error:
+        clear_console()
+        print(error)
+        return False
     finally:
         # Also lock when Ctrl-C, EOF, or an unexpected error interrupts the menu.
         session.lock()
