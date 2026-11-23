@@ -1,0 +1,13 @@
+[run]
+branch = True
+source = passwdmanager
+relative_files = True
+patch =
+    subprocess
+    execv
+
+[report]
+show_missing = True
+
+[xml]
+output = coverage.xml

@@ -7,3 +7,8 @@ data/
 *.log
 .DS_Store
 logs/
+.scannerwork/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
