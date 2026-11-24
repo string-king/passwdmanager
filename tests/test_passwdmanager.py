@@ -310,12 +310,41 @@ class VaultTests(unittest.TestCase):
         self.add_entry()
         summary = pm.list_entries(self.database, self.alice)[0]
         output = io.StringIO()
-        with patch.object(self.alice, "read_input", side_effect=["2", "Changed", "user", "y", "replacement secret"]) as reader, \
+        with patch.object(self.alice, "read_input", side_effect=["2", "Changed", "user", "y", "n", "replacement secret"]) as reader, \
                 patch.object(pm, "clear_console"), contextlib.redirect_stdout(output):
             self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Entry updated.")
         reader.assert_any_call("New entry password: ", hidden=True)
         self.assertNotIn("replacement secret", output.getvalue())
         self.assertNotIn("stored secret", output.getvalue())
+
+    def test_generated_password_is_encrypted_and_not_displayed_when_adding(self):
+        generated = "Generated-Only-For-Tests-9!"
+        output = io.StringIO()
+        with patch.object(self.alice, "read_input", side_effect=["site", "user", "y", "", ""]), \
+                patch.object(pm, "generate_password", return_value=generated) as generator, \
+                contextlib.redirect_stdout(output):
+            pm.prompt_add_entry(self.database, self.alice)
+        generator.assert_called_once_with(20, include_symbols=True)
+        entry_id = pm.list_entries(self.database, self.alice)[0]["id"]
+        self.assertEqual(pm.load_entry(self.database, self.alice, entry_id)["password"], generated)
+        payload = self.database.execute("SELECT payload FROM entries WHERE id = ?", (entry_id,)).fetchone()[0]
+        self.assertNotIn(generated.encode(), payload)
+        self.assertNotIn(generated, output.getvalue())
+
+    def test_edit_can_replace_password_with_generated_value(self):
+        entry_id = self.add_entry()
+        summary = pm.list_entries(self.database, self.alice)[0]
+        with patch.object(self.alice, "read_input", side_effect=["", "", "y", "y", "32", "n"]), \
+                patch.object(pm, "generate_password", return_value="GeneratedTest9") as generator:
+            pm.prompt_edit_entry(self.database, self.alice, summary)
+        generator.assert_called_once_with(32, include_symbols=False)
+        self.assertEqual(pm.load_entry(self.database, self.alice, entry_id)["password"], "GeneratedTest9")
+
+    def test_invalid_generation_options_do_not_save_entry(self):
+        with patch.object(self.alice, "read_input", side_effect=["site", "user", "y", "abc"]):
+            with self.assertRaises(ValueError):
+                pm.prompt_add_entry(self.database, self.alice)
+        self.assertEqual(pm.list_entries(self.database, self.alice), [])
 
     def test_delete_requires_exact_confirmation(self):
         self.add_entry()
@@ -329,6 +358,98 @@ class VaultTests(unittest.TestCase):
                 patch.object(pm, "clear_console"), patch("builtins.print"):
             self.assertEqual(pm.entry_actions(self.database, self.alice, summary), "Entry deleted.")
         self.assertEqual(pm.list_entries(self.database, self.alice), [])
+
+    def assert_entry_write_rolls_back(self, operation, action, *arguments):
+        before = [tuple(row) for row in self.database.execute("SELECT * FROM entries ORDER BY id")]
+        # FAIL leaves a statement's earlier writes pending: the app must roll them back.
+        self.database.execute(f"""
+            CREATE TRIGGER injected_failure AFTER {operation} ON entries BEGIN
+                UPDATE users SET username = 'changed by failing trigger' WHERE id = 2;
+                SELECT RAISE(FAIL, 'injected write failure');
+            END
+        """)
+        with patch.object(pm, "log_event") as log:
+            with self.assertRaises(sqlite3.IntegrityError):
+                action(self.database, self.alice, *arguments)
+        self.assertEqual([tuple(row) for row in self.database.execute("SELECT * FROM entries ORDER BY id")], before)
+        self.assertEqual(self.database.execute("SELECT username FROM users WHERE id = 2").fetchone()[0], "bob")
+        self.assertFalse(self.database.in_transaction)
+        log.assert_not_called()
+
+    def test_failed_insert_rolls_back_all_transaction_changes(self):
+        self.assert_entry_write_rolls_back("INSERT", pm.add_entry, "site", "user", "secret")
+
+    def test_failed_update_rolls_back_all_transaction_changes(self):
+        entry_id = self.add_entry()
+        self.assert_entry_write_rolls_back("UPDATE", pm.update_entry, entry_id, "changed", "user")
+
+    def test_failed_delete_rolls_back_all_transaction_changes(self):
+        entry_id = self.add_entry()
+        self.assert_entry_write_rolls_back("DELETE", pm.delete_entry, entry_id)
+
+    def test_commit_failure_rolls_back_update_and_does_not_log_success(self):
+        entry_id = self.add_entry()
+        before = pm.load_entry(self.database, self.alice, entry_id)
+        self.database.execute("PRAGMA defer_foreign_keys = ON")
+        self.database.execute("""
+            CREATE TRIGGER fail_commit AFTER UPDATE ON entries BEGIN
+                INSERT INTO entries (id, owner_id, payload) VALUES ('orphan', 999, X'00');
+            END
+        """)
+        with patch.object(pm, "log_event") as log:
+            with self.assertRaises(sqlite3.IntegrityError):
+                pm.update_entry(self.database, self.alice, entry_id, "changed", "user")
+        log.assert_not_called()
+        self.assertEqual(pm.load_entry(self.database, self.alice, entry_id), before)
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM entries").fetchone()[0], 1)
+        self.assertFalse(self.database.in_transaction)
+
+    def test_timeout_during_each_edit_prompt_preserves_record(self):
+        entry_id = self.add_entry()
+        before = pm.load_entry(self.database, self.alice, entry_id)
+        prompts = ["Service (Enter to keep): ", "Username/email (Enter to keep): ",
+                   "Replace password? [y/N]: ", "Generate password? [y/N]: ", "New entry password: "]
+        for target in prompts:
+            with self.subTest(prompt=target):
+                session = pm.Session(1, self.alice_cipher)
+                session.clipboard = Mock(warning="")
+                now = session.deadline - pm.IDLE_SECONDS
+                choices = iter(["2", "1", "2"])
+                def respond(prompt):
+                    nonlocal now
+                    if prompt == target:
+                        now = session.deadline
+                    if prompt == "Choice: ":
+                        return next(choices)
+                    if prompt == "Generate password? [y/N]: ":
+                        return "n"
+                    return "y" if prompt == "Replace password? [y/N]: " else "changed value"
+                with patch("builtins.input", side_effect=respond), patch.object(pm, "read_password", side_effect=respond), \
+                        patch.object(pm.time, "monotonic", side_effect=lambda: now), \
+                        patch.object(pm, "clear_console"), patch("builtins.print"):
+                    self.assertFalse(pm.run_vault(self.database, session))
+                self.assertIsNone(session.cipher)
+                session.clipboard.clear.assert_called()
+                self.assertEqual(pm.load_entry(self.database, self.alice, entry_id), before)
+
+    def test_timeout_during_delete_confirmation_preserves_record(self):
+        entry_id = self.add_entry()
+        self.alice.clipboard.warning = ""
+        now = self.alice.deadline - pm.IDLE_SECONDS
+        choices = iter(["2", "1", "3"])
+        def respond(prompt):
+            nonlocal now
+            if prompt.startswith("Delete this entry?"):
+                now = self.alice.deadline
+                return "DELETE"
+            return next(choices)
+        with patch("builtins.input", side_effect=respond), \
+                patch.object(pm.time, "monotonic", side_effect=lambda: now), \
+                patch.object(pm, "clear_console"), patch("builtins.print"):
+            self.assertFalse(pm.run_vault(self.database, self.alice))
+        self.assertIsNone(self.alice.cipher)
+        self.alice.clipboard.clear.assert_called()
+        self.assertEqual(self.database.execute("SELECT id FROM entries").fetchone()[0], entry_id)
 
     def test_browser_preserves_page_boundaries_and_back_action(self):
         self.add_entry()

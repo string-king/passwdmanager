@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import secrets
+import string
 import stat
 import signal
 import subprocess
@@ -710,6 +712,39 @@ def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -
         print("Choose 1, 2, 3, or 4.")
 
 
+def generate_password(length: int = 20, *, include_symbols: bool = True) -> str:
+    """Use secure randomness and require a character from every selected group."""
+    if type(length) is not int or not 12 <= length <= 128:
+        raise ValueError("Generated password length must be 12 to 128 characters.")
+    if type(include_symbols) is not bool:
+        raise ValueError("Include symbols must be true or false.")
+    groups = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
+    if include_symbols:
+        groups.append("!@#$%^&*()-_=+?")
+    alphabet = "".join(groups)
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        if all(any(character in group for character in password) for group in groups):
+            return password
+
+
+def prompt_entry_password(session: Session, prompt: str = "Entry password: ") -> str:
+    """Read a hidden password or generate one without displaying it."""
+    generate = session.read_input("Generate password? [y/N]: ").strip().lower()
+    if generate in ("", "n"):
+        return session.read_input(prompt, hidden=True)
+    if generate != "y":
+        raise ValueError("Choose Y or N.")
+    length_text = session.read_input("Password length [20], range 12-128: ").strip()
+    if length_text and (not length_text.isascii() or not length_text.isdigit() or len(length_text) > 3):
+        raise ValueError("Generated password length must be 12 to 128 characters.")
+    symbols = session.read_input("Include symbols? [Y/n]: ").strip().lower()
+    if symbols not in ("", "y", "n"):
+        raise ValueError("Choose Y or N.")
+    session.require_unlocked()
+    return generate_password(int(length_text) if length_text else 20, include_symbols=symbols != "n")
+
+
 def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dict):
     """Keep blank display fields and replace passwords only by explicit choice."""
     service = session.read_input("Service (Enter to keep): ") or entry["service"]
@@ -719,7 +754,7 @@ def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dic
     replace = session.read_input("Replace password? [y/N]: ").strip().lower()
     if replace not in ("", "n", "y"):
         raise ValueError("Choose Y or N. Entry was not changed.")
-    password = session.read_input("New entry password: ", hidden=True) if replace == "y" else None
+    password = prompt_entry_password(session, "New entry password: ") if replace == "y" else None
     try:
         update_entry(database, session, entry["id"], service, username, password)
     finally:
@@ -762,7 +797,7 @@ def prompt_add_entry(database: sqlite3.Connection, session: Session):
     validate_entry_field(service, "Service")
     username = session.read_input("Username/email: ")
     validate_entry_field(username, "Entry username")
-    password = session.read_input("Entry password: ", hidden=True)
+    password = prompt_entry_password(session)
     try:
         add_entry(database, session, service, username, password)
     finally:
