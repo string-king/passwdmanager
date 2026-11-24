@@ -114,7 +114,8 @@ class Clipboard:
         self.owner_id = owner_id
         self.digest = None
         self.timer = None
-        self.mutex = threading.Lock()
+        # Copy may call clear while holding the lock; timers still serialize here.
+        self.mutex = threading.RLock()
         self.warning = ""
         self.generation = 0
 
@@ -124,6 +125,17 @@ class Clipboard:
         password = None
         try:
             with self.mutex:
+                # Finish tracking any previous copy before replacing its fingerprint.
+                if self.digest is not None:
+                    self.clear()
+                    if self.digest is not None:
+                        raise ValueError("Could not clear the previous password. Clear the clipboard manually and try again.")
+                self.digest = hashlib.sha256(data).digest()
+                self.warning = ""
+                self.generation += 1
+                self.timer = threading.Timer(CLIPBOARD_SECONDS, self.clear, args=(self.generation,))
+                self.timer.daemon = True
+                self.timer.start()
                 try:
                     subprocess.run(
                         ["/usr/bin/pbcopy"], input=data, capture_output=True,
@@ -132,15 +144,9 @@ class Clipboard:
                     )
                 except (OSError, subprocess.SubprocessError):
                     log_event("operation_failed", user_id=self.owner_id, operation="clipboard_copy")
+                    # pbcopy may have written the password before reporting failure.
+                    self.clear()
                     raise ValueError("Could not copy the password. Clear the clipboard manually if needed.") from None
-                if self.timer is not None:
-                    self.timer.cancel()
-                self.digest = hashlib.sha256(data).digest()
-                self.warning = ""
-                self.generation += 1
-                self.timer = threading.Timer(CLIPBOARD_SECONDS, self.clear, args=(self.generation,))
-                self.timer.daemon = True
-                self.timer.start()
 
         finally:
             wipe_buffer(data)

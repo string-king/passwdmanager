@@ -79,6 +79,8 @@ class MemoryTests(unittest.TestCase):
             with self.subTest(failure=failure):
                 captured = []
                 def copy(command, **kwargs):
+                    if command[0] == "/usr/bin/pbpaste":
+                        return subprocess.CompletedProcess(command, 0, stdout=b"unrelated")
                     captured.append(kwargs["input"])
                     self.assertEqual(kwargs["input"], b"secret")
                     if failure:

@@ -444,7 +444,85 @@ class ClipboardTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self.clipboard.copy("secret")
         self.assertNotIn("sensitive diagnostic", str(caught.exception))
-        self.timer_factory.assert_not_called()
+        self.timer_factory.return_value.cancel.assert_called_once_with()
+        self.assertIsNotNone(self.clipboard.digest)
+        self.assertIn("Clear it manually", self.clipboard.warning)
+
+    def test_copy_failure_before_writing_preserves_unrelated_clipboard(self):
+        self.contents = b"unrelated user content"
+        def fail_copy(command, **kwargs):
+            if command[0] == "/usr/bin/pbcopy" and kwargs.get("input"):
+                self.assertIsNotNone(self.clipboard.digest)
+                raise OSError("copy failed before writing")
+            return self.run_clipboard(command, **kwargs)
+        self.process.side_effect = fail_copy
+        with self.assertRaises(ValueError):
+            self.clipboard.copy("secret")
+        self.assertEqual(self.contents, b"unrelated user content")
+        self.assertIsNone(self.clipboard.digest)
+        self.assertIsNone(self.clipboard.timer)
+        self.assertEqual(self.clipboard.warning, "")
+
+    def test_copy_failure_after_writing_clears_password(self):
+        errors = [OSError("copy failed"), subprocess.TimeoutExpired("pbcopy", 3),
+                  subprocess.CalledProcessError(1, "pbcopy")]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                def fail_after_write(command, **kwargs):
+                    result = self.run_clipboard(command, **kwargs)
+                    if command[0] == "/usr/bin/pbcopy" and kwargs.get("input"):
+                        raise error
+                    return result
+                self.process.side_effect = fail_after_write
+                with self.assertRaises(ValueError):
+                    self.clipboard.copy("secret")
+                self.assertEqual(self.contents, b"")
+                self.assertIsNone(self.clipboard.digest)
+                self.assertIsNone(self.clipboard.timer)
+                self.assertEqual(self.clipboard.warning, "")
+
+    def test_failed_copy_and_cleanup_retain_tracking_for_retry(self):
+        def fail_copy_and_clear(command, **kwargs):
+            if command[0] == "/usr/bin/pbcopy":
+                if kwargs.get("input"):
+                    self.contents = bytes(kwargs["input"])
+                raise OSError("clipboard unavailable")
+            return self.run_clipboard(command, **kwargs)
+        self.process.side_effect = fail_copy_and_clear
+        with self.assertRaises(ValueError):
+            self.clipboard.copy("secret")
+        self.assertEqual(self.contents, b"secret")
+        self.assertIsNotNone(self.clipboard.digest)
+        self.assertIn("Clear it manually", self.clipboard.warning)
+        self.process.side_effect = self.run_clipboard
+        self.clipboard.clear()
+        self.assertEqual(self.contents, b"")
+        self.assertIsNone(self.clipboard.digest)
+        self.assertEqual(self.clipboard.warning, "")
+
+    def test_failed_replacement_does_not_leave_previous_password_untracked(self):
+        self.clipboard.copy("first")
+        def fail_new_copy(command, **kwargs):
+            if command[0] == "/usr/bin/pbcopy" and kwargs.get("input"):
+                raise OSError("new copy failed")
+            return self.run_clipboard(command, **kwargs)
+        self.process.side_effect = fail_new_copy
+        with self.assertRaises(ValueError):
+            self.clipboard.copy("second")
+        self.assertEqual(self.contents, b"")
+        self.assertIsNone(self.clipboard.digest)
+
+    def test_unclearable_previous_copy_blocks_replacement(self):
+        self.clipboard.copy("first")
+        digest = self.clipboard.digest
+        self.process.side_effect = OSError("clipboard unavailable")
+        with self.assertRaisesRegex(ValueError, "previous password"):
+            self.clipboard.copy("second")
+        self.assertEqual(self.contents, b"first")
+        self.assertEqual(self.clipboard.digest, digest)
+        self.process.side_effect = self.run_clipboard
+        self.clipboard.clear()
+        self.assertEqual(self.contents, b"")
 
     def test_clear_failure_warns_and_can_be_retried(self):
         self.clipboard.copy("secret")
