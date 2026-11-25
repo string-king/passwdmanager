@@ -207,22 +207,15 @@ class Session:
         """Interrupt only terminal input; never interrupt a vault write or copy."""
         self.require_unlocked()
 
-        def expire(signum, frame):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
             raise SessionExpired(INACTIVITY_MESSAGE)
-
-        previous_handler = signal.getsignal(signal.SIGALRM)
-        if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
-            raise RuntimeError("An existing process alarm prevents safe vault timing.")
-        signal.signal(signal.SIGALRM, expire)
         try:
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0:
-                raise SessionExpired(INACTIVITY_MESSAGE)
+            # terminal_mode owns the signal handler; only input arms the timer.
             signal.setitimer(signal.ITIMER_REAL, remaining)
             value = read_password(prompt) if hidden else input(prompt)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
 
         self.require_unlocked()
         self.deadline = time.monotonic() + IDLE_SECONDS
@@ -712,37 +705,20 @@ def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -
         print("Choose 1, 2, 3, or 4.")
 
 
-def generate_password(length: int = 20, *, include_symbols: bool = True) -> str:
-    """Use secure randomness and require a character from every selected group."""
-    if type(length) is not int or not 12 <= length <= 128:
-        raise ValueError("Generated password length must be 12 to 128 characters.")
-    if type(include_symbols) is not bool:
-        raise ValueError("Include symbols must be true or false.")
-    groups = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
-    if include_symbols:
-        groups.append("!@#$%^&*()-_=+?")
-    alphabet = "".join(groups)
-    while True:
-        password = "".join(secrets.choice(alphabet) for _ in range(length))
-        if all(any(character in group for character in password) for group in groups):
-            return password
+def generate_password() -> str:
+    """Generate a 20-character password using secure randomness."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+?"
+    return "".join(secrets.choice(alphabet) for _ in range(20))
 
 
 def prompt_entry_password(session: Session, prompt: str = "Entry password: ") -> str:
-    """Read a hidden password or generate one without displaying it."""
-    generate = session.read_input("Generate password? [y/N]: ").strip().lower()
-    if generate in ("", "n"):
+    """Generate a password or read one without displaying it."""
+    choice = session.read_input("Generate a 20-character password? [y/N]: ").strip().lower()
+    if choice == "y":
+        return generate_password()
+    if choice in ("", "n"):
         return session.read_input(prompt, hidden=True)
-    if generate != "y":
-        raise ValueError("Choose Y or N.")
-    length_text = session.read_input("Password length [20], range 12-128: ").strip()
-    if length_text and (not length_text.isascii() or not length_text.isdigit() or len(length_text) > 3):
-        raise ValueError("Generated password length must be 12 to 128 characters.")
-    symbols = session.read_input("Include symbols? [Y/n]: ").strip().lower()
-    if symbols not in ("", "y", "n"):
-        raise ValueError("Choose Y or N.")
-    session.require_unlocked()
-    return generate_password(int(length_text) if length_text else 20, include_symbols=symbols != "n")
+    raise ValueError("Choose Y or N.")
 
 
 def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dict):
@@ -893,7 +869,9 @@ def run(database: sqlite3.Connection):
 
 
 def interrupt_exit(signum, frame):
-    """Use orderly exit for terminal quit and suspension requests."""
+    """Unwind input so normal finally blocks restore the terminal and lock."""
+    if signum == signal.SIGALRM:
+        raise SessionExpired(INACTIVITY_MESSAGE)
     raise KeyboardInterrupt
 
 
@@ -906,13 +884,14 @@ def terminal_mode():
     settings[0] &= ~(termios.IXON | termios.IXOFF)
     previous_handlers = {}
     try:
-        for signum in (signal.SIGTSTP, signal.SIGQUIT):
+        for signum in (signal.SIGTSTP, signal.SIGQUIT, signal.SIGALRM):
             previous_handlers[signum] = signal.signal(signum, interrupt_exit)
         termios.tcsetattr(descriptor, termios.TCSANOW, settings)
         yield
     finally:
         try:
             # Discard unfinished input and restore echo even after interrupted getpass.
+            signal.setitimer(signal.ITIMER_REAL, 0)
             termios.tcsetattr(descriptor, termios.TCSAFLUSH, original)
         finally:
             for signum, handler in previous_handlers.items():
@@ -920,39 +899,26 @@ def terminal_mode():
 
 
 def main() -> int:
-    """Check terminal support, manage the database lifetime, and report failures."""
+    """Open resources, run the terminal interface, and always close resources."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Run this application in an interactive terminal.")
         return 1
 
+    database = None
+    log_handler = None
     try:
         with terminal_mode():
-            return run_application()
+            log_handler = configure_logging()
+            database = open_database()
+            run(database)
+    except (EOFError, KeyboardInterrupt):
+        print("\nExiting.")
     except termios.error:
         print("Unable to configure or restore terminal settings.", file=sys.stderr)
         return 1
-    except (EOFError, KeyboardInterrupt):
-        print("\nExiting.")
-        return 0
-
-
-def run_application() -> int:
-    """Manage logging and database resources inside the terminal context."""
-    try:
-        log_handler = configure_logging()
-    except OSError:
-        print("Unable to open the security log. Check permissions and disk space.")
-        return 1
-
-    database = None
-    try:
-        database = open_database()
-        run(database)
-    except (EOFError, KeyboardInterrupt):
-        print("\nExiting.")
     except (OSError, sqlite3.Error):
-        log_event("operation_failed", operation="database")
-        print("Unable to access the vault database. Check permissions and disk space.")
+        log_event("operation_failed", operation="application_files")
+        print("Unable to access application files. Check permissions and disk space.")
         return 1
     except getpass.GetPassWarning:
         print("Hidden password input is unavailable. Exiting.")
@@ -963,9 +929,10 @@ def run_application() -> int:
     finally:
         if database is not None:
             database.close()
-        LOGGER.removeHandler(log_handler)
-        log_handler.stream.close()
-        log_handler.close()
+        if log_handler is not None:
+            LOGGER.removeHandler(log_handler)
+            log_handler.stream.close()
+            log_handler.close()
     return 0
 
 

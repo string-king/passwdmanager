@@ -1,4 +1,4 @@
-"""Password generation rules and hidden/manual prompt behavior."""
+"""The generator has one fixed option; manual passwords remain hidden."""
 
 import string
 import unittest
@@ -8,73 +8,36 @@ import passwdmanager as pm
 
 
 class PasswordGenerationTests(unittest.TestCase):
-    def test_length_alphabet_and_required_groups(self):
-        symbols = "!@#$%^&*()-_=+?"
-        for length in [12, 20, 128]:
-            for include_symbols in [False, True]:
-                with self.subTest(length=length, symbols=include_symbols):
-                    password = pm.generate_password(length, include_symbols=include_symbols)
-                    self.assertEqual(len(password), length)
-                    groups = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
-                    if include_symbols:
-                        groups.append(symbols)
-                    self.assertLessEqual(set(password), set("".join(groups)))
-                    for group in groups:
-                        self.assertTrue(any(character in group for character in password))
+    def test_generated_password_has_twenty_allowed_characters(self):
+        password = pm.generate_password()
+        self.assertEqual(len(password), 20)
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+?"
+        self.assertLessEqual(set(password), set(alphabet))
 
-    def test_uses_secure_choice_and_rejects_missing_groups(self):
-        accepted = "aA1!bbbbbbbb"
-        with patch.object(pm.secrets, "choice", side_effect="a" * 12 + accepted) as choice:
-            self.assertEqual(pm.generate_password(12), accepted)
-        self.assertEqual(choice.call_count, 24)
+    def test_symbols_are_available_to_the_random_choice(self):
+        # A fixed choice checks symbol support without relying on random luck.
+        with patch.object(pm.secrets, "choice", return_value="!") as choice:
+            self.assertEqual(pm.generate_password(), "!" * 20)
+        self.assertIn("!", choice.call_args.args[0])
 
-    def test_invalid_lengths_and_option_types(self):
-        for value in [0, 11, 129, 10**10, True, None, "20", 20.0]:
-            with self.subTest(length=value), self.assertRaises(ValueError):
-                pm.generate_password(value)
-        for value in [None, "yes", 1]:
-            with self.subTest(symbols=value), self.assertRaises(ValueError):
-                pm.generate_password(include_symbols=value)
-
-    def test_manual_input_remains_hidden(self):
-        for answer in ["", "n", "N"]:
-            session = Mock()
-            session.read_input.side_effect = [answer, "manual secret"]
-            with self.subTest(answer=answer), patch.object(pm, "generate_password") as generator:
-                self.assertEqual(pm.prompt_entry_password(session), "manual secret")
-                session.read_input.assert_called_with("Entry password: ", hidden=True)
-                generator.assert_not_called()
-
-    def test_invalid_prompt_choices_never_generate(self):
-        options = [["maybe"], ["y", "-1"], ["y", "1.5"], ["y", "9" * 5000],
-                   ["y", "１２"], ["y", "20", "maybe"]]
-        for answers in options:
-            session = Mock()
-            session.read_input.side_effect = answers
-            with self.subTest(answers=answers[:2]), patch.object(pm, "generate_password") as generator:
-                with self.assertRaises(ValueError):
-                    pm.prompt_entry_password(session)
-                generator.assert_not_called()
-
-    def test_timeout_during_generation_options_never_generates(self):
-        for position in range(3):
-            session = Mock()
-            answers = ["y", "20", "n"]
-            answers[position] = pm.SessionExpired(pm.INACTIVITY_MESSAGE)
-            session.read_input.side_effect = answers
-            with self.subTest(position=position), patch.object(pm, "generate_password") as generator:
-                with self.assertRaises(pm.SessionExpired):
-                    pm.prompt_entry_password(session)
-                generator.assert_not_called()
-
-    def test_expired_session_cannot_generate_after_options(self):
+    def test_generation_needs_only_one_choice(self):
         session = Mock()
-        session.read_input.side_effect = ["y", "20", "n"]
-        session.require_unlocked.side_effect = pm.SessionExpired(pm.INACTIVITY_MESSAGE)
-        with patch.object(pm, "generate_password") as generator:
-            with self.assertRaises(pm.SessionExpired):
-                pm.prompt_entry_password(session)
-            generator.assert_not_called()
+        session.read_input.return_value = "y"
+        password = pm.prompt_entry_password(session)
+        self.assertEqual(len(password), 20)
+        session.read_input.assert_called_once()
+
+    def test_manual_password_is_read_with_hidden_input(self):
+        session = Mock()
+        session.read_input.side_effect = ["", "manual secret"]
+        self.assertEqual(pm.prompt_entry_password(session), "manual secret")
+        session.read_input.assert_called_with("Entry password: ", hidden=True)
+
+    def test_invalid_choice_is_rejected(self):
+        session = Mock()
+        session.read_input.return_value = "maybe"
+        with self.assertRaises(ValueError):
+            pm.prompt_entry_password(session)
 
 
 if __name__ == "__main__":
