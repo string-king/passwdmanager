@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import clipboard
 import passwdmanager as pm
 import security
 
@@ -108,13 +109,13 @@ class SecurityTests(unittest.TestCase):
 class ClipboardTests(unittest.TestCase):
     def setUp(self):
         # Suppress real timers; mock subprocess.run separately in each test.
-        timer_patch = patch.object(pm.threading, "Timer")
+        timer_patch = patch.object(clipboard.threading, "Timer")
         timer_patch.start()
         self.addCleanup(timer_patch.stop)
-        self.clipboard = pm.Clipboard()
+        self.clipboard = clipboard.Clipboard()
 
     def test_unchanged_clipboard_is_cleared_and_input_buffer_is_wiped(self):
-        with patch.object(pm.subprocess, "run") as command:
+        with patch.object(clipboard.subprocess, "run") as command:
             self.clipboard.copy("secret")
             buffer = command.call_args.kwargs["input"]
             self.assertEqual(buffer, bytearray(6))
@@ -124,7 +125,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNone(self.clipboard.digest)
 
     def test_unrelated_clipboard_contents_are_preserved(self):
-        with patch.object(pm.subprocess, "run") as command:
+        with patch.object(clipboard.subprocess, "run") as command:
             self.clipboard.copy("secret")
             command.reset_mock()
             command.return_value.stdout = b"user copied something else"
@@ -137,19 +138,19 @@ class ClipboardTests(unittest.TestCase):
         responses = [subprocess.TimeoutExpired("pbcopy", 3),
                      subprocess.CompletedProcess([], 0, stdout=b"secret"),
                      subprocess.CompletedProcess([], 0)]
-        with patch.object(pm.subprocess, "run", side_effect=responses) as command:
+        with patch.object(clipboard.subprocess, "run", side_effect=responses) as command:
             with self.assertRaises(ValueError):
                 self.clipboard.copy("secret")
             self.assertEqual(command.call_args.kwargs["input"], b"")
         self.assertIsNone(self.clipboard.digest)
 
     def test_failed_cleanup_warns_and_keeps_tracking_for_retry(self):
-        with patch.object(pm.subprocess, "run", side_effect=OSError("test failure")):
+        with patch.object(clipboard.subprocess, "run", side_effect=OSError("test failure")):
             with self.assertRaises(ValueError):
                 self.clipboard.copy("secret")
         self.assertIsNotNone(self.clipboard.digest)
         self.assertIn("Clear it manually", self.clipboard.warning)
-        with patch.object(pm.subprocess, "run") as command:
+        with patch.object(clipboard.subprocess, "run") as command:
             command.return_value.stdout = b"secret"
             self.clipboard.clear()
         self.assertIsNone(self.clipboard.digest)

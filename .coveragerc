@@ -4,6 +4,7 @@ source =
     passwdmanager
     security
     audit
+    clipboard
 relative_files = True
 
 [report]
