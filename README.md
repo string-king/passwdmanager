@@ -1,153 +1,152 @@
-# passwdmanager
+# Password manager
 
-A password manager for the ICS0022 Secure Programming project.
-
-## Current status
-
-Registration, login, encrypted credential storage, and clipboard retrieval are
-implemented in `passwdmanager.py`. Entries are listed in pages of 10, newest
-first. Passwords are never printed. See [PROGRESS.md](PROGRESS.md) for a short
-checkpoint 2 progress note.
-
-## Checkpoint 1: scope
-
-The design and threat model below were written for checkpoint 1. They describe
-the intended application, including features that are still planned.
-
-The application will use Python and a terminal interface, initially on macOS.
-Each account will have a username, a master password, and its own set of encrypted
-entries in a local SQLite database. Each saved entry will contain a service name,
-username/email, and password. SQLite uses Python's built-in `sqlite3` module and
-does not require a database server or another Python package.
-
-Users will be able to add, list, update, delete, and copy credentials. Passwords
-will never be displayed in cleartext. The vault will lock after five minutes of inactivity.
-
-## Architecture and data flow
-
-```mermaid
-flowchart TD
-    UI[Terminal interface] --> U[User management: registration and login]
-    UI --> V[Vault operations: entries and ownership checks]
-    U -->|Authenticated user| V
-    U -->|Verify password and derive key| C[Encryption module: Argon2id and Fernet]
-    U -->|Read and save account metadata| S[Storage layer]
-    V -->|Encrypt or decrypt entries| C
-    V -->|Read or save encrypted entries| S
-    S <--> F[SQLite database: users and entries]
-    V -->|Explicit copy request| CB[macOS clipboard]
-```
-
-- **Registration:** the application will create an account with a salted
-  password hash. A new account will start with no entries.
-- **Login:** the application will verify the master password and derive the
-  user's encryption key before opening a session.
-- **Vault operations:** the application will access only the logged-in user's
-  entries. It will decrypt entries when needed and encrypt changes before saving.
-- **Lock or exit:** the application will release session data and attempt to
-  clear sensitive memory and any copied password, as described below.
-
-Plaintext credentials and keys are used only in the running process. Disk files
-and user input are treated as untrusted. The operating system is assumed to be
-trusted; this application cannot protect an unlocked vault from local malware.
-
-## Vault format and cryptographic scheme
-
-The application will use the **cryptography** library for:
-
-- **Argon2id:** hashes the master password so it can be checked without storing
-  it in plaintext. Separately, it derives an encryption key from that password.
-  It deliberately uses time and memory to make password guessing more expensive.
-- **Fernet:** encrypts and decrypts saved entries using that key, and detects
-  tampering with the encrypted data.
-
-Everything else will use Python's standard library and macOS clipboard utilities.
-
-One local SQLite database, `data/passwords.db`, will contain two tables:
-
-| Table | Contents |
-| --- | --- |
-| `users` | User ID, unique username, salted password hash, and encryption-key derivation salt and settings. |
-| `entries` | Entry ID, owner ID linked to a user, and encrypted entry data. |
-
-Each entry will be stored as encrypted JSON containing its service name,
-username/email, owner ID, and entry ID. Its password will be included in the
-same encrypted data. The application will check the encrypted IDs against the
-selected record and logged-in user to detect swapped records.
-
-Argon2id will use separate random salts for password verification and encryption-key
-derivation. A salt is a non-secret random value that makes identical passwords
-produce different results. The encryption key will not be stored, and the stored
-password hash will not be used as the key. Argon2id's time and memory settings
-will be tested during implementation; unsupported settings will be rejected.
-
-Entries will be encrypted before reaching SQLite. Database transactions will
-keep changes together or undo them if saving fails. The database itself will
-not be encrypted, so account usernames, record ownership, entry counts, and
-Fernet timestamps will remain visible.
-
-References: [Fernet](https://cryptography.io/en/stable/fernet/),
-[Argon2id](https://cryptography.io/en/stable/hazmat/primitives/key-derivation-functions/#argon2id), and
-[Python sqlite3](https://docs.python.org/3/library/sqlite3.html).
-
-## Threat model
-
-| Area | Threat | Planned mitigation |
-| --- | --- | --- |
-| Master password | Someone steals the database and guesses the password. | Salted Argon2id hashing and key derivation will make guessing more expensive. Weak passwords may still be guessed. |
-| Master password | Passwords leak through input or logs. | Password prompts will hide input. Passwords will not appear in command arguments or logs. |
-| Vault at rest | Someone reads or changes stored credentials. | Fernet will protect entry contents and detect tampering. Database file permissions will restrict access to the OS user. |
-| Vault at rest | Another account accesses a user's entries. | Each user will have a separate encryption key. All entry operations will check ownership against the logged-in account. |
-| Vault at rest | A failed save leaves incomplete changes. | SQLite transactions will prevent partial updates. |
-| Database interface | Input is interpreted as SQL commands. | Parameterized queries will keep user input separate from SQL instructions. |
-| Vault in memory | Decrypted passwords or keys remain in memory. | The application will limit copies, overwrite changeable buffers where possible, and release session data on lock or exit. It will lock after five minutes of inactivity, including while waiting for input. |
-| Interface | Passwords appear on screen or remain on the clipboard. | Passwords will stay masked and will be copied only on request. Clipboard clearing will run after 20 seconds and on lock, logout, or normal exit, only if the copied password is still present. |
-| Interface | Unexpected input causes errors or reveals secrets. | The application will check input types and lengths, safely display special characters, and report errors without exposing sensitive data. |
-
-Python cannot guarantee that every copy of a password or key is erased from
-memory. This limitation will need further attention for the later memory-handling
-requirement. Clipboard history may retain copied passwords, and clearing cannot
-be guaranteed after a crash or forced exit.
-
-## Current terminal menus
-
-The application uses numbered menus:
-
-```text
-Start menu                 Unlocked vault
-1. Register                1. Add entry
-2. Log in                  2. List entries
-3. Exit                    3. Lock / log out
-                           4. Exit
-```
-
-Registration and login prompt for a username and a hidden master password.
-New master passwords must contain 12 to 1024 characters.
-In List entries, use N/P to change pages, B to go back, or a row number to copy
-that entry's password. Row numbers restart on each page. The application attempts
-to clear copied passwords after 20 seconds and on logout/exit, if unchanged.
+A terminal password manager for the ICS0022 Secure Programming project.
+Each account has its own encrypted vault. You can save, browse, edit, delete,
+and copy credentials without displaying passwords.
 
 ## Setup and run
 
-Requirements: macOS, Python 3.15 with its built-in `sqlite3`
-module, and the `cryptography` package. No separate database installation is needed.
-Python does not require a separate compilation step for this application.
-
-The development environment can be prepared from the repository directory:
+Use macOS with Python 3.15. The application uses the macOS clipboard commands
+`pbcopy` and `pbpaste`. Run these commands from the project directory:
 
 ```sh
 python3.15 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
-
-Run in an interactive terminal:
-
-```sh
 python passwdmanager.py
 ```
 
-The application creates `data/passwords.db` on first launch. No separate build
-step is needed. Local database files, logs, and the virtual environment are
-excluded from Git. Use Lock / log out when stepping away; automatic locking is
-not implemented yet.
+Run it in an interactive terminal. The only external runtime package is
+`cryptography`; SQLite is included with Python.
+
+For later runs, activate the environment and start the application:
+
+```sh
+source .venv/bin/activate
+python passwdmanager.py
+```
+
+## Register and log in
+
+Choose **1. Register** from the welcome menu. Enter a username containing
+1 to 64 printable characters and a master password containing 12 to 1024
+characters. Usernames cannot be empty or only spaces. Repeat the password to
+confirm it. Invalid input is retried in place.
+
+Choose **2. Log in** to unlock your vault. Password input is hidden, so nothing
+appears while you type. If login fails, you can retry or return to the welcome
+menu. There is no master-password recovery or reset feature.
+
+## Add an entry
+
+Choose **1. Add entry** after logging in. Enter the service name, such as GitHub,
+and the username or email used for that service. Each field accepts 1 to 256
+printable characters and cannot be empty or only spaces.
+
+You can generate a 20-character password or enter one yourself. Generated
+passwords use letters, digits, and symbols. Manual passwords accept 1 to 1024
+characters and remain hidden. At a Y/N prompt, Enter means no.
+
+If a field is invalid, correct it at the same prompt. Earlier valid answers are
+kept. The entry is saved after all fields are valid.
+
+An account cannot save two entries with exactly the same service name and
+username/email, even if their passwords differ. Matching is case-sensitive.
+Edit the existing entry to change its password. Other accounts can use the
+same service and username/email.
+
+## Browse and search
+
+Choose **2. Browse entries** to see service names, usernames/emails, and update
+times. Entries appear newest first, with 10 per page. Passwords are not listed.
+
+| Input | Action |
+| --- | --- |
+| N / P | Go to the next / previous page. |
+| F | Filter by part of a service name or username/email, ignoring case. |
+| C | Clear the filter and show all entries. |
+| B | Return to the vault menu. |
+| Row number | Open actions for that entry. |
+
+At the filter prompt, pressing Enter without typing also clears the filter. Changing or clearing
+the filter returns to page one. The filter stays active after entry actions.
+Row numbers restart on each page.
+
+## Copy, edit, or delete
+
+Select an entry's row number to open its actions:
+
+- **Copy password:** copy it to the clipboard, then paste it where needed.
+  The application attempts to clear it after 20 seconds, provided the clipboard
+  still contains that password. Unrelated clipboard contents are left alone.
+- **Edit entry:** enter new service or username/email values, or press Enter to
+  keep them. The password stays unchanged unless you choose to replace it.
+- **Delete entry:** type `DELETE` to confirm. Any other response cancels deletion.
+- **Back:** return to browsing.
+
+If clipboard copying or clearing fails, follow the message and clear the
+clipboard manually if needed.
+
+## Lock and exit
+
+Choose **3. Lock / log out** to lock the vault and return to the welcome menu.
+Choose **4. Exit password manager** to lock it and quit. From the welcome menu,
+choose **3. Exit password manager**.
+
+The vault locks if you leave a prompt unanswered for five minutes. Locking also
+attempts to clear any tracked password from
+the clipboard. Ctrl-C, Ctrl-Z, and Ctrl-Backslash exit through the normal cleanup
+path. Ctrl-Z exits rather than suspending the application.
+
+## Data and limitations
+
+The application creates these files beside the source code:
+
+- `data/passwords.db`: account metadata and encrypted entries.
+- `logs/events.jsonl`: security events, one JSON object per line, without passwords
+  or entry contents.
+
+Keep the database to retain your accounts and entries. To back it up, close the
+application and copy `data/passwords.db` to a safe location. Use one running
+instance at a time, since the application checks for duplicates before saving.
+
+Entries are encrypted with Fernet. Argon2id verifies the master password and
+separately derives the encryption key. Account usernames, record ownership,
+entry counts, and Fernet timestamps remain visible in the database.
+
+Python cannot guarantee erasing every password or key copy from memory. The
+application overwrites mutable buffers where possible and releases sensitive
+references after use. Clipboard history can retain copied passwords, and a crash
+or forced termination can prevent clipboard cleanup. An unlocked vault also
+cannot protect against malware running on your machine.
+
+## Troubleshooting
+
+If the application requests an interactive terminal, run it directly in Terminal
+or another terminal emulator with the environment activated. It exits if it
+cannot hide password input.
+
+For file-access errors, check permissions and available disk space. For clipboard
+errors, clear the clipboard manually before copying another password.
+
+## Run the tests
+
+Tests use temporary databases and mock clipboard commands, leaving your vault
+and clipboard untouched.
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -q
+```
+
+To generate coverage reports:
+
+```sh
+python -m coverage run -m unittest discover -s tests -q
+python -m coverage report
+python -m coverage html
+python -m coverage xml
+```
+
+Open `htmlcov/index.html` for the detailed report. The XML report is
+`coverage.xml`.
