@@ -192,31 +192,65 @@ def prompt_edit_entry(database: sqlite3.Connection, session: sessions.Session, e
 # Keep plaintext input local to these short prompt functions. Returning releases
 # their local references; Python cannot guarantee erasing every memory copy.
 def prompt_registration(database: sqlite3.Connection):
-    """Collect and confirm a new master password, then register the account."""
-    username = input("Username: ")
-    print("Master password must contain 12 to 1024 characters.")
-    password = sessions.read_password("Master password: ")
-    confirmation = None
-    try:
-        security.validate_master_password(password)
-        confirmation = sessions.read_password("Confirm master password: ")
-        if password != confirmation:
-            raise ValueError("Passwords do not match.")
-        confirmation = None
-        vault.register_account(database, username, password)
-    finally:
+    """Retry invalid registration fields without exposing password contents."""
+    print("Create an account — choose a username and a master password for your vault.")
+    print("Username: 1–64 printable characters, not only spaces.")
+    print("Master password: 12–1024 characters. Input is hidden.")
+    while True:
+        username = input("Choose your username: ")
+        try:
+            security.validate_account_username(username)
+        except ValueError as error:
+            print(f"{error} Please try again.")
+            continue
         password = None
         confirmation = None
+        try:
+            while True:
+                password = sessions.read_password("Choose your master password (hidden): ")
+                try:
+                    security.validate_master_password(password)
+                    break
+                except ValueError as error:
+                    password = None
+                    print(f"{error} Please try again.")
+            while True:
+                confirmation = sessions.read_password("Repeat your master password (hidden): ")
+                if password == confirmation:
+                    confirmation = None
+                    break
+                confirmation = None
+                print("Passwords do not match. Repeat the master password you just chose.")
+            try:
+                vault.register_account(database, username, password)
+                return
+            except ValueError as error:
+                print(f"{error} Please choose a username and password again.")
+        finally:
+            password = None
+            confirmation = None
 
 
-def prompt_login(database: sqlite3.Connection) -> sessions.Session:
-    """Collect hidden login credentials and return the authenticated session."""
-    username = input("Username: ")
-    password = sessions.read_password("Master password: ")
-    try:
-        return vault.login_account(database, username, password)
-    finally:
-        password = None
+def prompt_login(database: sqlite3.Connection) -> sessions.Session | None:
+    """Offer another login attempt or return without revealing account existence."""
+    print("Log in — enter your account username and master password to unlock your vault.")
+    print("Your master password is hidden while you type.")
+    while True:
+        username = input("Account username: ")
+        password = sessions.read_password("Master password (hidden): ")
+        try:
+            return vault.login_account(database, username, password)
+        except ValueError:
+            print("Unable to log in. Check your username and master password.")
+        finally:
+            password = None
+        while True:
+            choice = input("1. Try logging in again  2. Return to the welcome menu: ").strip()
+            if choice == "1":
+                break
+            if choice == "2":
+                return None
+            print("Choose 1 to retry or 2 to return to the welcome menu.")
 
 
 def prompt_add_entry(database: sqlite3.Connection, session: sessions.Session):
@@ -236,14 +270,16 @@ def run_vault(database: sqlite3.Connection, session: sessions.Session) -> bool:
     lock_reason = "error"
     try:
         clear_console()
-        print("Vault unlocked.")
+        print("Login successful. Your vault is unlocked.")
         while True:
             if session.clipboard.warning:
                 print(session.clipboard.warning)
-            print("\n1. Add entry")
-            print("2. List entries")
-            print("3. Lock / log out")
-            print("4. Exit")
+            print(f"\nLogged in as {session.username}")
+            print("Your vault locks after five minutes without input.")
+            print("1. Add entry — save credentials for a service")
+            print("2. Browse entries — copy, edit, or delete saved credentials")
+            print("3. Lock / log out — return to the welcome menu")
+            print("4. Exit password manager — lock your vault and quit")
             choice = session.read_input("Choice: ")
             clear_console()
             try:
@@ -282,17 +318,21 @@ def run_vault(database: sqlite3.Connection, session: sessions.Session) -> bool:
         session.lock(reason=lock_reason)
         if session.clipboard.warning:
             print(session.clipboard.warning)
-        print("Vault locked.")
+        if lock_reason in ("logout", "inactivity"):
+            print("Vault locked. Returning to the welcome menu.")
+        else:
+            print("Vault locked.")
 
 
 def run(database: sqlite3.Connection):
     """Run the start menu and hand successful logins to the vault menu."""
     clear_console()
     while True:
-        print("\nPassword manager")
-        print("1. Register")
-        print("2. Log in")
-        print("3. Exit")
+        print("\nWelcome to Password Manager")
+        print("Store credentials in your own encrypted vault. Passwords are never displayed.")
+        print("1. Register — create an account and master password")
+        print("2. Log in — unlock your existing vault")
+        print("3. Exit password manager")
         choice = input("Choice: ")
         clear_console()
 
@@ -305,15 +345,15 @@ def run(database: sqlite3.Connection):
                 clear_console()
                 print(error)
         elif choice == "2":
-            try:
-                session = prompt_login(database)
-            except ValueError as error:
+            session = prompt_login(database)
+            if session is None:
                 clear_console()
-                print(error)
                 continue
             if run_vault(database, session):
+                print("Exiting password manager. Goodbye.")
                 return
         elif choice == "3":
+            print("Exiting password manager. Goodbye.")
             return
         else:
             print("Choose 1, 2, or 3.")
@@ -333,7 +373,7 @@ def main() -> int:
             database = vault.open_database()
             run(database)
     except (EOFError, KeyboardInterrupt):
-        print("\nExiting.")
+        print("\nInput interrupted. Exiting password manager. Goodbye.")
     except TerminalError:
         print("Unable to configure or restore terminal settings.", file=sys.stderr)
         return 1

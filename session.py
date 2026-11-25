@@ -26,10 +26,11 @@ class SessionExpired(Exception):
 class Session:
     """Keep the authenticated account and its temporary encryption object."""
 
-    def __init__(self, owner_id: int, cipher: Fernet):
+    def __init__(self, owner_id: int, cipher: Fernet, username: str = ""):
         """Start an unlocked session with its own clipboard tracker."""
         security.validate_owner_id(owner_id)
         self.owner_id = owner_id
+        self.username = username
         self.cipher = cipher
         self.clipboard = clipboard.Clipboard(owner_id)
         self.deadline = time.monotonic() + IDLE_SECONDS

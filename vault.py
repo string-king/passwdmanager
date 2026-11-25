@@ -134,7 +134,7 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
 
         # Reuse the same input buffer; the returned key and Fernet internals are immutable.
         key = security.password_kdf(user["key_salt"]).derive(password_bytes)
-        session = sessions.Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+        session = sessions.Session(user["id"], Fernet(base64.urlsafe_b64encode(key)), username)
     finally:
         security.wipe_buffer(password_bytes)
         key = None

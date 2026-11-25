@@ -35,6 +35,7 @@ class VaultTests(unittest.TestCase):
     def test_correct_login_opens_the_account_vault(self):
         session = vault.login_account(self.database, "alice", "alice master password")
         self.assertEqual(session.owner_id, self.session.owner_id)
+        self.assertEqual(session.username, "alice")
         self.assertIsNotNone(session.cipher)
         session.lock()
 
@@ -48,6 +49,35 @@ class VaultTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already taken"):
             vault.register_account(self.database, "alice", "different master password")
         self.assertEqual(self.database.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1)
+
+    def test_registration_retries_invalid_fields_and_confirmation(self):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["", "new account"]):
+            with patch.object(sessions, "read_password", side_effect=[
+                "short", "new master password", "mismatch", "new master password",
+            ]):
+                with contextlib.redirect_stdout(output):
+                    pm.prompt_registration(self.database)
+        session = vault.login_account(self.database, "new account", "new master password")
+        self.addCleanup(session.lock)
+        self.assertEqual(session.username, "new account")
+        self.assertNotIn("new master password", output.getvalue())
+        self.assertNotIn("mismatch", output.getvalue())
+
+    def test_failed_login_can_retry_or_return_without_exposing_secrets(self):
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["unknown", "invalid choice", "1", "alice"]):
+            with patch.object(sessions, "read_password", side_effect=["wrong password", "alice master password"]):
+                with contextlib.redirect_stdout(output):
+                    session = pm.prompt_login(self.database)
+        self.addCleanup(session.lock)
+        self.assertEqual(session.owner_id, self.session.owner_id)
+        with patch("builtins.input", side_effect=["unknown", "2"]):
+            with patch.object(sessions, "read_password", return_value="wrong password"):
+                with contextlib.redirect_stdout(output):
+                    self.assertIsNone(pm.prompt_login(self.database))
+        self.assertNotIn("wrong password", output.getvalue())
+        self.assertNotIn("alice master password", output.getvalue())
 
     def test_credentials_are_encrypted_and_readable_after_reopening(self):
         entry_id = self.add_entry()
