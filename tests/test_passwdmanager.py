@@ -188,6 +188,17 @@ class VaultTests(unittest.TestCase):
             pm.print_entries(summaries)
         self.assertNotIn("entry secret", output.getvalue())
 
+    def test_unrepresentable_local_timestamp_does_not_break_display(self):
+        # Simulate date conversion failing, independently of the machine's timezone.
+        timestamp = Mock()
+        timestamp.astimezone.side_effect = OverflowError("date value out of range")
+        entry = dict(service="Example", username="alice", updated_at=timestamp)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            pm.print_entries([entry])
+        self.assertIn("Invalid date", output.getvalue())
+        self.assertIn("Example", output.getvalue())
+
     def test_failed_transaction_rolls_back_instead_of_logging_success(self):
         entry_id = self.add_entry()
         original = vault.load_entry(self.database, self.session, entry_id)

@@ -33,7 +33,12 @@ def print_entries(entries: list[dict]):
     rows = []
     for number, entry in enumerate(entries, start=1):
         updated_at = entry["updated_at"]
-        time_text = updated_at.astimezone().strftime("%Y-%m-%d %H:%M") if updated_at else "Unknown"
+        time_text = "Unknown"
+        if updated_at:
+            try:
+                time_text = updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
+            except (OverflowError, ValueError):
+                time_text = "Invalid date"
         # Keep long fields from making the table excessively wide.
         service = entry["service"]
         username = entry["username"]
