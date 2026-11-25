@@ -242,6 +242,41 @@ class VaultTests(unittest.TestCase):
                             pm.prompt_add_entry(self.database, self.session)
         self.assertEqual(vault.list_entries(self.database, self.session), [])
 
+    def test_browse_filter_matches_service_or_username_and_clear_resets_page(self):
+        entries = [dict(id=str(i), service=f"Site {i}", username="alice", updated_at=None)
+                   for i in range(12)]
+        answers = ["n", "f", "SITE 11", "f", "ALICE", "n", "c", "b"]
+        with patch.object(self.session, "read_input", side_effect=answers):
+            with patch.object(pm, "print_entry_page") as render:
+                pm.browse_entries(self.database, self.session, entries)
+        pages = render.call_args_list
+        self.assertEqual(pages[1].args[1], 1)
+        self.assertEqual(pages[2].args[0], [entries[11]])
+        self.assertEqual(pages[2].args[1], 0)
+        self.assertEqual(pages[3].args[0], entries)
+        self.assertEqual(pages[-1].args[1], 0)
+        self.assertEqual(pages[-1].args[-1], "")
+
+    def test_browse_keeps_filter_after_edit_and_handles_no_matches(self):
+        entry_id = self.add_entry("Target service")
+        self.add_entry("Other service")
+        def edit_selected(database, session, entry):
+            self.assertEqual(entry["id"], entry_id)
+            vault.update_entry(database, session, entry["id"], "Renamed", "new user")
+            return "Entry updated."
+        answers = ["f", "target", "1", "c", "b"]
+        output = io.StringIO()
+        with patch.object(self.session, "read_input", side_effect=answers):
+            with patch.object(pm, "entry_actions", side_effect=edit_selected):
+                with patch.object(pm, "print_entry_page", wraps=pm.print_entry_page) as render:
+                    with contextlib.redirect_stdout(output):
+                        pm.browse_entries(self.database, self.session, vault.list_entries(self.database, self.session))
+        empty_page = render.call_args_list[2].args
+        self.assertEqual(empty_page[0], [])
+        self.assertEqual(empty_page[-1], "target")
+        self.assertEqual(len(render.call_args_list[3].args[0]), 2)
+        self.assertIn("No matching entries", output.getvalue())
+
     def test_logging_records_events_without_credential_contents(self):
         path = self.folder / "logs" / "events.jsonl"
         handler = audit.configure_logging(path)

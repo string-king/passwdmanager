@@ -54,7 +54,7 @@ def print_entries(entries: list[dict]):
 
 
 def print_entry_page(entries: list[dict], page: int, page_count: int,
-                     message: str, clipboard_warning: str):
+                     message: str, clipboard_warning: str, filter_text: str = ""):
     """Render one page and its status messages without changing navigation."""
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(entries))
@@ -62,12 +62,17 @@ def print_entry_page(entries: list[dict], page: int, page_count: int,
     print(f"Page {page + 1} of {page_count} | {len(entries)} entries")
     if entries:
         print(f"Showing {start + 1}-{end}, newest first.\n")
-    print_entries(entries[start:end])
+    if filter_text:
+        print(f"Filter: {filter_text} (service name or username/email)")
+    if filter_text and not entries:
+        print("No matching entries. Change or clear the filter to see more entries.")
+    else:
+        print_entries(entries[start:end])
     if message:
         print(f"\n{message}")
     if clipboard_warning:
         print(clipboard_warning)
-    print("\n[N] Next  [P] Previous  [B] Back")
+    print("\n[N] Next  [P] Previous  [F] Filter  [C] Clear filter  [B] Back")
     print("Enter a row number for entry actions.")
 
 
@@ -75,13 +80,17 @@ def browse_entries(database: sqlite3.Connection, session: sessions.Session, entr
     """Browse display fields and open actions for the selected row."""
     page = 0
     message = ""
+    filter_text = ""
     while True:
-        page_count = max(1, (len(entries) + PAGE_SIZE - 1) // PAGE_SIZE)
+        matching = [entry for entry in entries if
+                    filter_text.casefold() in entry["service"].casefold() or
+                    filter_text.casefold() in entry["username"].casefold()]
+        page_count = max(1, (len(matching) + PAGE_SIZE - 1) // PAGE_SIZE)
         page = min(page, page_count - 1)
         start = page * PAGE_SIZE
-        page_entries = entries[start:start + PAGE_SIZE]
+        page_entries = matching[start:start + PAGE_SIZE]
         row_numbers = [str(number) for number in range(1, len(page_entries) + 1)]
-        print_entry_page(entries, page, page_count, message, session.clipboard.warning)
+        print_entry_page(matching, page, page_count, message, session.clipboard.warning, filter_text)
         choice = session.read_input("Choice: ").strip().lower()
         message = ""
         try:
@@ -91,6 +100,15 @@ def browse_entries(database: sqlite3.Connection, session: sessions.Session, entr
             elif choice == "p":
                 message = "Already on the first page." if page == 0 else ""
                 page = max(page - 1, 0)
+            elif choice == "f":
+                value = session.read_input("Filter service name or username/email (partial text; Enter clears): ").strip()
+                if value:
+                    security.validate_entry_field(value, "Filter")
+                filter_text = value
+                page = 0
+            elif choice == "c":
+                filter_text = ""
+                page = 0
             elif choice == "b":
                 clear_console()
                 return
@@ -99,7 +117,7 @@ def browse_entries(database: sqlite3.Connection, session: sessions.Session, entr
                 message = entry_actions(database, session, selected_entry)
                 entries = vault.list_entries(database, session)
             else:
-                message = "Choose a row number shown on this page, N, P, or B."
+                message = "Choose a row number shown on this page, N, P, F, C, or B."
         except ValueError as error:
             message = str(error)
 
