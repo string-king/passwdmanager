@@ -29,8 +29,32 @@ class VaultTests(unittest.TestCase):
         self.session.clipboard = Mock(warning="")
         self.addCleanup(self.session.lock)
 
-    def add_entry(self):
-        return vault.add_entry(self.database, self.session, "Example", "alice@example.test", "entry secret")
+    def add_entry(self, service="Example"):
+        return vault.add_entry(self.database, self.session, service, "alice@example.test", "entry secret")
+
+    def test_duplicate_service_and_username_are_rejected_only_for_same_account(self):
+        self.add_entry()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            vault.add_entry(self.database, self.session, "Example", "alice@example.test", "different password")
+        self.assertEqual(len(vault.list_entries(self.database, self.session)), 1)
+        vault.add_entry(self.database, self.session, "Example", "another user", "secret")
+        self.add_entry("example")  # Matching is exact and case-sensitive.
+        vault.register_account(self.database, "bob", "bob master password")
+        bob = vault.login_account(self.database, "bob", "bob master password")
+        bob.clipboard = Mock()
+        self.addCleanup(bob.lock)
+        vault.add_entry(self.database, bob, "Example", "alice@example.test", "secret")
+        self.assertEqual(len(vault.list_entries(self.database, bob)), 1)
+
+    def test_edit_rejects_duplicate_but_allows_keeping_own_service_and_username(self):
+        first = self.add_entry()
+        second = self.add_entry("Other service")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            vault.update_entry(self.database, self.session, second, "Example", "alice@example.test", "replacement")
+        entry = vault.load_entry(self.database, self.session, second)
+        self.assertEqual((entry["service"], entry["password"]), ("Other service", "entry secret"))
+        vault.update_entry(self.database, self.session, first, "Example", "alice@example.test", "replacement")
+        self.assertEqual(vault.load_entry(self.database, self.session, first)["password"], "replacement")
 
     def test_correct_login_opens_the_account_vault(self):
         session = vault.login_account(self.database, "alice", "alice master password")
@@ -93,7 +117,7 @@ class VaultTests(unittest.TestCase):
 
     def test_update_and_delete_change_only_selected_entry(self):
         entry_id = self.add_entry()
-        other_id = self.add_entry()
+        other_id = self.add_entry("Other service")
         vault.update_entry(self.database, self.session, entry_id, "Changed", "new user", "new secret")
         entry = vault.load_entry(self.database, self.session, entry_id)
         self.assertEqual((entry["service"], entry["username"], entry["password"]),
@@ -133,7 +157,7 @@ class VaultTests(unittest.TestCase):
         self.session.clipboard.copy.assert_not_called()
 
     def test_swapped_encrypted_records_are_rejected(self):
-        first, second = self.add_entry(), self.add_entry()
+        first, second = self.add_entry(), self.add_entry("Other service")
         payload = self.database.execute("SELECT payload FROM entries WHERE id = ?", (first,)).fetchone()[0]
         with self.database:
             self.database.execute("UPDATE entries SET payload = ? WHERE id = ?", (payload, second))

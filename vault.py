@@ -143,6 +143,28 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
     return session
 
 
+def reject_duplicate_entry(database: sqlite3.Connection, session: sessions.Session,
+                           service: str, username: str, exclude_id: str | None = None):
+    """Compare encrypted records one at a time within this account only."""
+    session.require_unlocked()
+    rows = database.execute(
+        "SELECT id, payload FROM entries WHERE owner_id = ?",
+        (session.owner_id,),
+    )
+    try:
+        for row in rows:
+            if row["id"] == exclude_id:
+                continue
+            entry = decrypt_entry(session, row)
+            try:
+                if entry["service"] == service and entry["username"] == username:
+                    raise ValueError("An entry with this service and username/email already exists. Edit the existing entry instead.")
+            finally:
+                entry.clear()
+    finally:
+        rows.close()
+
+
 def add_entry(
     database: sqlite3.Connection, session: sessions.Session,
     service: str, username: str, password: str,
@@ -152,6 +174,7 @@ def add_entry(
     security.validate_entry_field(service, "Service")
     security.validate_entry_field(username, "Entry username")
     security.validate_password(password, "Entry password")
+    reject_duplicate_entry(database, session, service, username)
 
     entry_id = uuid.uuid4().hex
     entry = {
@@ -247,12 +270,13 @@ def update_entry(database: sqlite3.Connection, session: sessions.Session, entry_
     if password is not None:
         security.validate_password(password, "Entry password")
     entry = load_entry(database, session, entry_id)
-    if password is not None:
-        entry["password"] = password
-    entry["service"] = service
-    entry["username"] = username
-    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
     try:
+        reject_duplicate_entry(database, session, service, username, exclude_id=entry_id)
+        if password is not None:
+            entry["password"] = password
+        entry["service"] = service
+        entry["username"] = username
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
         payload = session.cipher.encrypt(json.dumps(entry).encode("utf-8"))
     finally:
         # Release plaintext field references before database I/O, even on failure.
