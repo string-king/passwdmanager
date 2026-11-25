@@ -18,6 +18,8 @@ import session as sessions
 
 DATABASE = Path(__file__).resolve().parent / "data" / "passwords.db"
 MAX_PAYLOAD_BYTES = 64 * 1024
+ENTRY_USERNAME_LABEL = "Entry username"
+ENTRY_PASSWORD_LABEL = "Entry password"
 
 
 def open_database(path: Path = DATABASE) -> sqlite3.Connection:
@@ -172,8 +174,8 @@ def add_entry(
     """Encrypt a new credential for the session's owner and return its ID."""
     session.require_unlocked()
     security.validate_entry_field(service, "Service")
-    security.validate_entry_field(username, "Entry username")
-    security.validate_password(password, "Entry password")
+    security.validate_entry_field(username, ENTRY_USERNAME_LABEL)
+    security.validate_password(password, ENTRY_PASSWORD_LABEL)
     reject_duplicate_entry(database, session, service, username)
 
     entry_id = uuid.uuid4().hex
@@ -220,8 +222,8 @@ def decrypt_entry(session: sessions.Session, row: sqlite3.Row) -> dict:
         security.validate_entry_id(entry["id"])
         security.validate_owner_id(entry["owner_id"])
         security.validate_entry_field(entry["service"], "Service")
-        security.validate_entry_field(entry["username"], "Entry username")
-        security.validate_password(entry["password"], "Entry password")
+        security.validate_entry_field(entry["username"], ENTRY_USERNAME_LABEL)
+        security.validate_password(entry["password"], ENTRY_PASSWORD_LABEL)
         # Older entries have no timestamp; do not invent an update time.
         updated_at = None
         if "updated_at" in entry:
@@ -266,9 +268,9 @@ def update_entry(database: sqlite3.Connection, session: sessions.Session, entry_
     """Update an owned entry; None preserves the existing password."""
     session.require_unlocked()
     security.validate_entry_field(service, "Service")
-    security.validate_entry_field(username, "Entry username")
+    security.validate_entry_field(username, ENTRY_USERNAME_LABEL)
     if password is not None:
-        security.validate_password(password, "Entry password")
+        security.validate_password(password, ENTRY_PASSWORD_LABEL)
     entry = load_entry(database, session, entry_id)
     try:
         reject_duplicate_entry(database, session, service, username, exclude_id=entry_id)

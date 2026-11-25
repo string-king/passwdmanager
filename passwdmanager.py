@@ -13,6 +13,7 @@ import vault
 
 
 PAGE_SIZE = 10
+CHOICE_PROMPT = "Choice: "
 
 
 def clear_console():
@@ -91,33 +92,34 @@ def browse_entries(database: sqlite3.Connection, session: sessions.Session, entr
         page_entries = matching[start:start + PAGE_SIZE]
         row_numbers = [str(number) for number in range(1, len(page_entries) + 1)]
         print_entry_page(matching, page, page_count, message, session.clipboard.warning, filter_text)
-        choice = session.read_input("Choice: ").strip().lower()
+        choice = session.read_input(CHOICE_PROMPT).strip().lower()
         message = ""
         try:
-            if choice == "n":
-                message = "Already on the last page." if page + 1 == page_count else ""
-                page = min(page + 1, page_count - 1)
-            elif choice == "p":
-                message = "Already on the first page." if page == 0 else ""
-                page = max(page - 1, 0)
-            elif choice == "f":
-                value = session.read_input("Filter service name or username/email (partial text; Enter clears): ").strip()
-                if value:
-                    security.validate_entry_field(value, "Filter")
-                filter_text = value
-                page = 0
-            elif choice == "c":
-                filter_text = ""
-                page = 0
-            elif choice == "b":
-                clear_console()
-                return
-            elif choice in row_numbers:
-                selected_entry = page_entries[int(choice) - 1]
-                message = entry_actions(database, session, selected_entry)
-                entries = vault.list_entries(database, session)
-            else:
-                message = "Choose a row number shown on this page, N, P, F, C, or B."
+            match choice:
+                case "n":
+                    message = "Already on the last page." if page + 1 == page_count else ""
+                    page = min(page + 1, page_count - 1)
+                case "p":
+                    message = "Already on the first page." if page == 0 else ""
+                    page = max(page - 1, 0)
+                case "f":
+                    value = session.read_input("Filter service name or username/email (partial text; Enter clears): ").strip()
+                    if value:
+                        security.validate_entry_field(value, "Filter")
+                    filter_text = value
+                    page = 0
+                case "c":
+                    filter_text = ""
+                    page = 0
+                case "b":
+                    clear_console()
+                    return
+                case _ if choice in row_numbers:
+                    selected_entry = page_entries[int(choice) - 1]
+                    message = entry_actions(database, session, selected_entry)
+                    entries = vault.list_entries(database, session)
+                case _:
+                    message = "Choose a row number shown on this page, N, P, F, C, or B."
         except ValueError as error:
             message = str(error)
 
@@ -128,7 +130,7 @@ def entry_actions(database: sqlite3.Connection, session: sessions.Session, entry
         clear_console()
         print(f"Service: {entry['service']}\nUsername/email: {entry['username']}")
         print("\n1. Copy password\n2. Edit entry\n3. Delete entry\n4. Back")
-        choice = session.read_input("Choice: ").strip()
+        choice = session.read_input(CHOICE_PROMPT).strip()
         if choice == "1":
             vault.copy_entry_password(database, session, entry["id"])
             return f"Password copied. Clipboard clears after {clipboard.CLIPBOARD_SECONDS} seconds if unchanged."
@@ -298,24 +300,25 @@ def run_vault(database: sqlite3.Connection, session: sessions.Session) -> bool:
             print("2. Browse entries — copy, edit, or delete saved credentials")
             print("3. Lock / log out — return to the welcome menu")
             print("4. Exit password manager — lock your vault and quit")
-            choice = session.read_input("Choice: ")
+            choice = session.read_input(CHOICE_PROMPT)
             clear_console()
             try:
-                if choice == "1":
-                    prompt_add_entry(database, session)
-                    clear_console()
-                    print("Entry saved.")
-                elif choice == "2":
-                    entries = vault.list_entries(database, session)
-                    browse_entries(database, session, entries)
-                elif choice == "3":
-                    lock_reason = "logout"
-                    return False
-                elif choice == "4":
-                    lock_reason = "exit"
-                    return True
-                else:
-                    print("Choose 1, 2, 3, or 4.")
+                match choice:
+                    case "1":
+                        prompt_add_entry(database, session)
+                        clear_console()
+                        print("Entry saved.")
+                    case "2":
+                        entries = vault.list_entries(database, session)
+                        browse_entries(database, session, entries)
+                    case "3":
+                        lock_reason = "logout"
+                        return False
+                    case "4":
+                        lock_reason = "exit"
+                        return True
+                    case _:
+                        print("Choose 1, 2, 3, or 4.")
             except ValueError as error:
                 clear_console()
                 print(error)
@@ -351,7 +354,7 @@ def run(database: sqlite3.Connection):
         print("1. Register — create an account and master password")
         print("2. Log in — unlock your existing vault")
         print("3. Exit password manager")
-        choice = input("Choice: ")
+        choice = input(CHOICE_PROMPT)
         clear_console()
 
         if choice == "1":
