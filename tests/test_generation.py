@@ -1,5 +1,7 @@
 """The generator has one fixed option; manual passwords remain hidden."""
 
+import contextlib
+import io
 import string
 import unittest
 from unittest.mock import Mock, patch
@@ -32,13 +34,18 @@ class PasswordGenerationTests(unittest.TestCase):
         session = Mock()
         session.read_input.side_effect = ["", "manual secret"]
         self.assertEqual(pm.prompt_entry_password(session), "manual secret")
-        session.read_input.assert_called_with("Entry password: ", hidden=True)
+        self.assertTrue(session.read_input.call_args.kwargs["hidden"])
 
-    def test_invalid_choice_is_rejected(self):
+    def test_invalid_choice_and_password_are_retried(self):
         session = Mock()
-        session.read_input.return_value = "maybe"
-        with self.assertRaises(ValueError):
-            pm.prompt_entry_password(session)
+        session.read_input.side_effect = ["maybe", "n", "", "x" * 1025, "manual secret"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(pm.prompt_entry_password(session), "manual secret")
+        self.assertEqual(session.read_input.call_count, 5)
+        self.assertTrue(all(call.kwargs["hidden"] for call in session.read_input.call_args_list[2:]))
+        self.assertNotIn("manual secret", output.getvalue())
+        self.assertNotIn("x" * 1025, output.getvalue())
 
 
 if __name__ == "__main__":

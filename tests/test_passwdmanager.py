@@ -160,6 +160,34 @@ class VaultTests(unittest.TestCase):
         self.assertEqual(len(password), 20)
         self.assertNotIn(password, output.getvalue())
 
+    def test_add_retries_only_the_invalid_field(self):
+        answers = ["", "x" * 257, "GitHub", "\x1b[2J", "alice", "y"]
+        with patch.object(self.session, "read_input", side_effect=answers):
+            with contextlib.redirect_stdout(io.StringIO()):
+                pm.prompt_add_entry(self.database, self.session)
+        entry = vault.list_entries(self.database, self.session)[0]
+        self.assertEqual((entry["service"], entry["username"]), ("GitHub", "alice"))
+
+    def test_edit_retries_fields_and_preserves_password_when_declined(self):
+        entry_id = self.add_entry()
+        summary = vault.list_entries(self.database, self.session)[0]
+        answers = ["   ", "", "\n", "new user", "maybe", "n"]
+        with patch.object(self.session, "read_input", side_effect=answers):
+            with contextlib.redirect_stdout(io.StringIO()):
+                pm.prompt_edit_entry(self.database, self.session, summary)
+        entry = vault.load_entry(self.database, self.session, entry_id)
+        self.assertEqual((entry["service"], entry["username"], entry["password"]),
+                         ("Example", "new user", "entry secret"))
+
+    def test_retrying_invalid_input_still_allows_timeout_or_interruption(self):
+        for error in [sessions.SessionExpired("Timed out"), KeyboardInterrupt()]:
+            with self.subTest(error=type(error).__name__):
+                with patch.object(self.session, "read_input", side_effect=["", error]):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(type(error)):
+                            pm.prompt_add_entry(self.database, self.session)
+        self.assertEqual(vault.list_entries(self.database, self.session), [])
+
     def test_logging_records_events_without_credential_contents(self):
         path = self.folder / "logs" / "events.jsonl"
         handler = audit.configure_logging(path)

@@ -128,26 +128,61 @@ def entry_actions(database: sqlite3.Connection, session: sessions.Session, entry
         print("Choose 1, 2, 3, or 4.")
 
 
-def prompt_entry_password(session: sessions.Session, prompt: str = "Entry password: ") -> str:
-    """Generate a password or read one without displaying it."""
-    choice = session.read_input("Generate a 20-character password? [y/N]: ").strip().lower()
-    if choice == "y":
+def prompt_yes_no(session: sessions.Session, prompt: str) -> bool:
+    """Retry a yes/no choice; Enter means no."""
+    while True:
+        choice = session.read_input(prompt).strip().lower()
+        if choice in ("y", "n", ""):
+            return choice == "y"
+        print("Please enter Y for yes or N for no (Enter also means no).")
+
+
+def prompt_entry_field(session: sessions.Session, label: str, example: str,
+                       current: str | None = None) -> str:
+    """Retry one display field while retaining earlier valid answers."""
+    hint = f"e.g. {example}; 1–256 printable characters"
+    if current is not None:
+        print(f"Current {label.lower()}: {current}")
+        hint += "; Enter to keep current value"
+    while True:
+        value = session.read_input(f"{label} ({hint}): ")
+        if value == "" and current is not None:
+            return current
+        try:
+            security.validate_entry_field(value, label)
+            return value
+        except ValueError:
+            if not value.strip():
+                print(f"{label} cannot be empty or only spaces. Please try again.")
+            elif len(value) > 256:
+                print(f"{label} must be at most 256 characters. Please try again.")
+            else:
+                print(f"{label} cannot contain control or non-printable characters. Please try again.")
+
+
+def prompt_entry_password(session: sessions.Session,
+                          prompt: str = "Entry password (1–1024 characters; hidden): ") -> str:
+    """Generate a password or retry hidden manual input until valid."""
+    if prompt_yes_no(session, "Generate a 20-character password? [y/N]: "):
         return security.generate_password()
-    if choice in ("", "n"):
-        return session.read_input(prompt, hidden=True)
-    raise ValueError("Choose Y or N.")
+    while True:
+        password = session.read_input(prompt, hidden=True)
+        try:
+            security.validate_password(password, "Entry password")
+            return password
+        except ValueError as error:
+            print(f"{error} Please try again.")
+        finally:
+            password = None
 
 
 def prompt_edit_entry(database: sqlite3.Connection, session: sessions.Session, entry: dict):
-    """Keep blank display fields and replace passwords only by explicit choice."""
-    service = session.read_input("Service (Enter to keep): ") or entry["service"]
-    security.validate_entry_field(service, "Service")
-    username = session.read_input("Username/email (Enter to keep): ") or entry["username"]
-    security.validate_entry_field(username, "Entry username")
-    replace = session.read_input("Replace password? [y/N]: ").strip().lower()
-    if replace not in ("", "n", "y"):
-        raise ValueError("Choose Y or N. Entry was not changed.")
-    password = prompt_entry_password(session, "New entry password: ") if replace == "y" else None
+    """Retry invalid fields and replace passwords only by explicit choice."""
+    print("Edit entry — Enter keeps the current service name or username/email.")
+    service = prompt_entry_field(session, "Service name", "GitHub", entry["service"])
+    username = prompt_entry_field(session, "Username or email", "alice@example.com", entry["username"])
+    replace = prompt_yes_no(session, "Replace password? [y/N]: ")
+    password = prompt_entry_password(session, "New entry password (1–1024 characters; hidden): ") if replace else None
     try:
         vault.update_entry(database, session, entry["id"], service, username, password)
     finally:
@@ -186,10 +221,9 @@ def prompt_login(database: sqlite3.Connection) -> sessions.Session:
 
 def prompt_add_entry(database: sqlite3.Connection, session: sessions.Session):
     """Validate each field as it is entered, then encrypt and save the entry."""
-    service = session.read_input("Service: ")
-    security.validate_entry_field(service, "Service")
-    username = session.read_input("Username/email: ")
-    security.validate_entry_field(username, "Entry username")
+    print("Add entry — enter the service, username/email, and a password.")
+    service = prompt_entry_field(session, "Service name", "GitHub")
+    username = prompt_entry_field(session, "Username or email", "alice@example.com")
     password = prompt_entry_password(session)
     try:
         vault.add_entry(database, session, service, username, password)
