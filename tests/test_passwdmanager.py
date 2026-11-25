@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import audit
 import passwdmanager as pm
 
 
@@ -133,7 +134,7 @@ class VaultTests(unittest.TestCase):
                 SELECT RAISE(FAIL, 'test write failure');
             END
         """)
-        with patch.object(pm, "log_event") as log:
+        with patch.object(audit, "log_event") as log:
             with self.assertRaises(sqlite3.IntegrityError):
                 pm.update_entry(self.database, self.session, entry_id, "Changed", "user")
         self.assertEqual(pm.load_entry(self.database, self.session, entry_id), original)
@@ -152,7 +153,7 @@ class VaultTests(unittest.TestCase):
 
     def test_logging_records_events_without_credential_contents(self):
         path = self.folder / "logs" / "events.jsonl"
-        handler = pm.configure_logging(path)
+        handler = audit.configure_logging(path)
         try:
             with self.assertRaises(ValueError):
                 pm.login_account(self.database, "unknown account", "wrong password")
@@ -160,7 +161,7 @@ class VaultTests(unittest.TestCase):
             pm.update_entry(self.database, self.session, entry_id, "Changed", "user")
             pm.delete_entry(self.database, self.session, entry_id)
         finally:
-            pm.LOGGER.removeHandler(handler)
+            audit.LOGGER.removeHandler(handler)
             handler.stream.close()
             handler.close()
         text = path.read_text()

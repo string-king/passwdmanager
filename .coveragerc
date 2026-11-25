@@ -1,6 +1,9 @@
 [run]
 branch = True
-source = passwdmanager
+source =
+    passwdmanager
+    security
+    audit
 relative_files = True
 
 [report]

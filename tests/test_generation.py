@@ -5,19 +5,20 @@ import unittest
 from unittest.mock import Mock, patch
 
 import passwdmanager as pm
+import security
 
 
 class PasswordGenerationTests(unittest.TestCase):
     def test_generated_password_has_twenty_allowed_characters(self):
-        password = pm.generate_password()
+        password = security.generate_password()
         self.assertEqual(len(password), 20)
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+?"
         self.assertLessEqual(set(password), set(alphabet))
 
     def test_symbols_are_available_to_the_random_choice(self):
         # A fixed choice checks symbol support without relying on random luck.
-        with patch.object(pm.secrets, "choice", return_value="!") as choice:
-            self.assertEqual(pm.generate_password(), "!" * 20)
+        with patch.object(security.secrets, "choice", return_value="!") as choice:
+            self.assertEqual(security.generate_password(), "!" * 20)
         self.assertIn("!", choice.call_args.args[0])
 
     def test_generation_needs_only_one_choice(self):

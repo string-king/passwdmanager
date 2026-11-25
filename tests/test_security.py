@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import passwdmanager as pm
+import security
 
 
 class SecurityTests(unittest.TestCase):
@@ -17,22 +18,22 @@ class SecurityTests(unittest.TestCase):
         for password in ["", "x" * 11, "x" * 1025, None]:
             with self.subTest(length=len(password) if password is not None else None):
                 with self.assertRaises(ValueError):
-                    pm.validate_master_password(password)
-        pm.validate_master_password("x" * 12)
-        pm.validate_master_password("õ" * 1024)
+                    security.validate_master_password(password)
+        security.validate_master_password("x" * 12)
+        security.validate_master_password("õ" * 1024)
         with self.assertRaises(ValueError):
-            pm.validate_password("", "Entry password")
-        pm.validate_password("x", "Entry password")
+            security.validate_password("", "Entry password")
+        security.validate_password("x", "Entry password")
 
     def test_invalid_names_and_record_ids_are_rejected(self):
         for username in ["", "   ", "x" * 65, "line\nbreak", None]:
             with self.subTest(username=username):
                 with self.assertRaises(ValueError):
-                    pm.validate_account_username(username)
+                    security.validate_account_username(username)
         for entry_id in ["", "A" * 32, "a" * 31, None]:
             with self.subTest(entry_id=entry_id):
                 with self.assertRaises(ValueError):
-                    pm.validate_entry_id(entry_id)
+                    security.validate_entry_id(entry_id)
 
     def test_invalid_encrypted_record_contents_have_safe_errors(self):
         session = pm.Session(1, pm.Fernet(pm.Fernet.generate_key()))
@@ -56,7 +57,7 @@ class SecurityTests(unittest.TestCase):
                 pm.register_account(database, "alice", "alice master password")
                 with database:
                     database.execute("UPDATE users SET memory_cost = 1")
-                with patch.object(pm, "password_kdf") as kdf:
+                with patch.object(security, "password_kdf") as kdf:
                     with self.assertRaises(ValueError):
                         pm.login_account(database, "alice", "alice master password")
                 kdf.assert_not_called()
@@ -78,14 +79,14 @@ class SecurityTests(unittest.TestCase):
     def test_wiping_overwrites_the_existing_buffer(self):
         secret = bytearray(b"secret")
         same_memory = memoryview(secret)
-        pm.wipe_buffer(secret)
+        security.wipe_buffer(secret)
         self.assertEqual(bytes(same_memory), b"\x00" * 6)
 
     def test_password_buffer_is_wiped_when_key_derivation_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             database = pm.open_database(Path(directory) / "vault.db")
             try:
-                with patch.object(pm, "password_kdf") as factory:
+                with patch.object(security, "password_kdf") as factory:
                     factory.return_value.derive.side_effect = RuntimeError("test KDF failure")
                     with self.assertRaises(RuntimeError):
                         pm.register_account(database, "alice", "alice master password")
