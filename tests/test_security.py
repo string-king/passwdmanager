@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import clipboard
 import passwdmanager as pm
+import session as sessions
 import security
 
 
@@ -37,7 +38,7 @@ class SecurityTests(unittest.TestCase):
                     security.validate_entry_id(entry_id)
 
     def test_invalid_encrypted_record_contents_have_safe_errors(self):
-        session = pm.Session(1, pm.Fernet(pm.Fernet.generate_key()))
+        session = sessions.Session(1, pm.Fernet(pm.Fernet.generate_key()))
         entry_id = "a" * 32
         entry = dict(id=entry_id, owner_id=True, service="site", username="user", password="secret")
         invalid_json = ["{broken", '{"id":"first","id":"second"}',
@@ -97,10 +98,10 @@ class SecurityTests(unittest.TestCase):
                 database.close()
 
     def test_expired_session_releases_key_and_clears_clipboard(self):
-        session = pm.Session(1, pm.Fernet(pm.Fernet.generate_key()))
+        session = sessions.Session(1, pm.Fernet(pm.Fernet.generate_key()))
         session.clipboard = Mock()
-        with patch.object(pm.time, "monotonic", return_value=session.deadline):
-            with self.assertRaises(pm.SessionExpired):
+        with patch.object(sessions.time, "monotonic", return_value=session.deadline):
+            with self.assertRaises(sessions.SessionExpired):
                 session.require_unlocked()
         self.assertIsNone(session.cipher)
         session.clipboard.clear.assert_called_once_with()

@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import audit
 import passwdmanager as pm
+import session as sessions
 
 
 class VaultTests(unittest.TestCase):
@@ -190,7 +191,7 @@ class VaultTests(unittest.TestCase):
     def test_timeout_during_delete_confirmation_does_not_delete(self):
         self.add_entry()
         # Navigate to the first entry, choose delete, then expire at confirmation.
-        answers = ["2", "1", "3", pm.SessionExpired(pm.INACTIVITY_MESSAGE)]
+        answers = ["2", "1", "3", sessions.SessionExpired(sessions.INACTIVITY_MESSAGE)]
         with patch.object(self.session, "read_input", side_effect=answers):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertFalse(pm.run_vault(self.database, self.session))

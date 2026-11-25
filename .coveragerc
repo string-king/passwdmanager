@@ -5,6 +5,7 @@ source =
     security
     audit
     clipboard
+    session
 relative_files = True
 
 [report]

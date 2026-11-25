@@ -1,17 +1,13 @@
 import base64
-from contextlib import contextmanager
+from getpass import GetPassWarning
+from termios import error as TerminalError
 from datetime import datetime, timezone
-import getpass
 import json
 import os
 from pathlib import Path
 import sqlite3
-import signal
 import sys
-import termios
-import time
 import uuid
-import warnings
 
 from cryptography.exceptions import InvalidKey, UnsupportedAlgorithm
 from cryptography.fernet import Fernet, InvalidToken
@@ -19,64 +15,12 @@ from cryptography.fernet import Fernet, InvalidToken
 import audit
 import clipboard
 import security
+import session as sessions
 
 
 DATABASE = Path(__file__).resolve().parent / "data" / "passwords.db"
 PAGE_SIZE = 10
-IDLE_SECONDS = 5 * 60
 MAX_PAYLOAD_BYTES = 64 * 1024
-INACTIVITY_MESSAGE = "Vault locked after five minutes of inactivity."
-
-
-class SessionExpired(Exception):
-    """Interrupt an idle vault, including a blocked terminal prompt."""
-
-
-class Session:
-    """Keep the authenticated account and its temporary encryption object."""
-
-    def __init__(self, owner_id: int, cipher: Fernet):
-        """Start an unlocked session with its own clipboard tracker."""
-        security.validate_owner_id(owner_id)
-        self.owner_id = owner_id
-        self.cipher = cipher
-        self.clipboard = clipboard.Clipboard(owner_id)
-        self.deadline = time.monotonic() + IDLE_SECONDS
-
-    def require_unlocked(self):
-        """Reject expired sessions even when called outside the terminal menu."""
-        if self.cipher is None:
-            raise ValueError("Vault is locked. Log in again.")
-        if time.monotonic() >= self.deadline:
-            self.lock(reason="inactivity")
-            raise SessionExpired(INACTIVITY_MESSAGE)
-
-    def read_input(self, prompt: str, *, hidden=False) -> str:
-        """Interrupt only terminal input; never interrupt a vault write or copy."""
-        self.require_unlocked()
-
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise SessionExpired(INACTIVITY_MESSAGE)
-        try:
-            # terminal_mode owns the signal handler; only input arms the timer.
-            signal.setitimer(signal.ITIMER_REAL, remaining)
-            value = read_password(prompt) if hidden else input(prompt)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-
-        self.require_unlocked()
-        self.deadline = time.monotonic() + IDLE_SECONDS
-        return value
-
-    def lock(self, reason: str = "logout"):
-        """Drop the encryption object and attempt to clear our clipboard copy."""
-        # Release the encryption object; this does not guarantee memory erasure.
-        was_unlocked = self.cipher is not None
-        self.cipher = None
-        self.clipboard.clear()
-        if was_unlocked:
-            audit.log_event("vault_locked", user_id=self.owner_id, reason=reason)
 
 
 def open_database(path: Path = DATABASE) -> sqlite3.Connection:
@@ -116,14 +60,6 @@ def open_database(path: Path = DATABASE) -> sqlite3.Connection:
     return database
 
 
-def read_password(prompt: str) -> str:
-    """Read hidden input, failing if the terminal cannot suppress echo."""
-    # Refuse getpass's fallback to visible input if the terminal cannot hide it.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", getpass.GetPassWarning)
-        return getpass.getpass(prompt)
-
-
 def clear_console():
     """Clear the visible screen when output goes to a terminal."""
     if sys.stdout.isatty():
@@ -161,7 +97,7 @@ def register_account(database: sqlite3.Connection, username: str, password: str)
     audit.log_event("account_created", user_id=result.lastrowid)
 
 
-def login_account(database: sqlite3.Connection, username: str, password: str) -> Session:
+def login_account(database: sqlite3.Connection, username: str, password: str) -> sessions.Session:
     """Verify credentials before deriving the account's vault encryption key."""
     failure = "Invalid username or master password."
     try:
@@ -208,7 +144,7 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
 
         # Reuse the same input buffer; the returned key and Fernet internals are immutable.
         key = security.password_kdf(user["key_salt"]).derive(password_bytes)
-        session = Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
+        session = sessions.Session(user["id"], Fernet(base64.urlsafe_b64encode(key)))
     finally:
         security.wipe_buffer(password_bytes)
         key = None
@@ -218,7 +154,7 @@ def login_account(database: sqlite3.Connection, username: str, password: str) ->
 
 
 def add_entry(
-    database: sqlite3.Connection, session: Session,
+    database: sqlite3.Connection, session: sessions.Session,
     service: str, username: str, password: str,
 ) -> str:
     """Encrypt a new credential for the session's owner and return its ID."""
@@ -253,7 +189,7 @@ def add_entry(
     return entry_id
 
 
-def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
+def decrypt_entry(session: sessions.Session, row: sqlite3.Row) -> dict:
     """Shared integrity checks for listing and password retrieval."""
     session.require_unlocked()
     entry = None
@@ -289,7 +225,7 @@ def decrypt_entry(session: Session, row: sqlite3.Row) -> dict:
     return entry
 
 
-def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) -> dict:
+def load_entry(database: sqlite3.Connection, session: sessions.Session, entry_id: str) -> dict:
     """Load and verify one owned record; callers must keep plaintext short-lived."""
     session.require_unlocked()
     security.validate_entry_id(entry_id)
@@ -302,7 +238,7 @@ def load_entry(database: sqlite3.Connection, session: Session, entry_id: str) ->
     return decrypt_entry(session, row)
 
 
-def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id: str):
+def copy_entry_password(database: sqlite3.Connection, session: sessions.Session, entry_id: str):
     """Re-read an owned entry and copy its password without printing."""
     entry = load_entry(database, session, entry_id)
     try:
@@ -312,7 +248,7 @@ def copy_entry_password(database: sqlite3.Connection, session: Session, entry_id
     audit.log_event("password_copied", user_id=session.owner_id)
 
 
-def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
+def update_entry(database: sqlite3.Connection, session: sessions.Session, entry_id: str,
                  service: str, username: str, password: str | None = None):
     """Update an owned entry; None preserves the existing password."""
     session.require_unlocked()
@@ -344,7 +280,7 @@ def update_entry(database: sqlite3.Connection, session: Session, entry_id: str,
     audit.log_event("entry_updated", user_id=session.owner_id)
 
 
-def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
+def delete_entry(database: sqlite3.Connection, session: sessions.Session, entry_id: str):
     """Delete only the authenticated user's selected record."""
     session.require_unlocked()
     security.validate_entry_id(entry_id)
@@ -359,7 +295,7 @@ def delete_entry(database: sqlite3.Connection, session: Session, entry_id: str):
     audit.log_event("entry_deleted", user_id=session.owner_id)
 
 
-def list_entries(database: sqlite3.Connection, session: Session) -> list[dict]:
+def list_entries(database: sqlite3.Connection, session: sessions.Session) -> list[dict]:
     """Return verified display fields, newest first, without plaintext passwords."""
     session.require_unlocked()
     rows = database.execute(
@@ -434,7 +370,7 @@ def print_entry_page(entries: list[dict], page: int, page_count: int,
     print("Enter a row number for entry actions.")
 
 
-def browse_entries(database: sqlite3.Connection, session: Session, entries: list[dict]):
+def browse_entries(database: sqlite3.Connection, session: sessions.Session, entries: list[dict]):
     """Browse display fields and open actions for the selected row."""
     page = 0
     message = ""
@@ -467,7 +403,7 @@ def browse_entries(database: sqlite3.Connection, session: Session, entries: list
             message = str(error)
 
 
-def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -> str:
+def entry_actions(database: sqlite3.Connection, session: sessions.Session, entry: dict) -> str:
     """Offer actions using display data only; never retain a decrypted password."""
     while True:
         clear_console()
@@ -491,7 +427,7 @@ def entry_actions(database: sqlite3.Connection, session: Session, entry: dict) -
         print("Choose 1, 2, 3, or 4.")
 
 
-def prompt_entry_password(session: Session, prompt: str = "Entry password: ") -> str:
+def prompt_entry_password(session: sessions.Session, prompt: str = "Entry password: ") -> str:
     """Generate a password or read one without displaying it."""
     choice = session.read_input("Generate a 20-character password? [y/N]: ").strip().lower()
     if choice == "y":
@@ -501,7 +437,7 @@ def prompt_entry_password(session: Session, prompt: str = "Entry password: ") ->
     raise ValueError("Choose Y or N.")
 
 
-def prompt_edit_entry(database: sqlite3.Connection, session: Session, entry: dict):
+def prompt_edit_entry(database: sqlite3.Connection, session: sessions.Session, entry: dict):
     """Keep blank display fields and replace passwords only by explicit choice."""
     service = session.read_input("Service (Enter to keep): ") or entry["service"]
     security.validate_entry_field(service, "Service")
@@ -523,11 +459,11 @@ def prompt_registration(database: sqlite3.Connection):
     """Collect and confirm a new master password, then register the account."""
     username = input("Username: ")
     print("Master password must contain 12 to 1024 characters.")
-    password = read_password("Master password: ")
+    password = sessions.read_password("Master password: ")
     confirmation = None
     try:
         security.validate_master_password(password)
-        confirmation = read_password("Confirm master password: ")
+        confirmation = sessions.read_password("Confirm master password: ")
         if password != confirmation:
             raise ValueError("Passwords do not match.")
         confirmation = None
@@ -537,17 +473,17 @@ def prompt_registration(database: sqlite3.Connection):
         confirmation = None
 
 
-def prompt_login(database: sqlite3.Connection) -> Session:
+def prompt_login(database: sqlite3.Connection) -> sessions.Session:
     """Collect hidden login credentials and return the authenticated session."""
     username = input("Username: ")
-    password = read_password("Master password: ")
+    password = sessions.read_password("Master password: ")
     try:
         return login_account(database, username, password)
     finally:
         password = None
 
 
-def prompt_add_entry(database: sqlite3.Connection, session: Session):
+def prompt_add_entry(database: sqlite3.Connection, session: sessions.Session):
     """Validate each field as it is entered, then encrypt and save the entry."""
     service = session.read_input("Service: ")
     security.validate_entry_field(service, "Service")
@@ -560,7 +496,7 @@ def prompt_add_entry(database: sqlite3.Connection, session: Session):
         password = None
 
 
-def run_vault(database: sqlite3.Connection, session: Session) -> bool:
+def run_vault(database: sqlite3.Connection, session: sessions.Session) -> bool:
     """Run the vault menu; return True to exit or False to log out. Always lock."""
     lock_reason = "error"
     try:
@@ -594,7 +530,7 @@ def run_vault(database: sqlite3.Connection, session: Session) -> bool:
             except ValueError as error:
                 clear_console()
                 print(error)
-    except SessionExpired as error:
+    except sessions.SessionExpired as error:
         lock_reason = "inactivity"
         clear_console()
         print(error)
@@ -648,36 +584,6 @@ def run(database: sqlite3.Connection):
             print("Choose 1, 2, or 3.")
 
 
-def interrupt_exit(signum, frame):
-    """Unwind input so normal finally blocks restore the terminal and lock."""
-    if signum == signal.SIGALRM:
-        raise SessionExpired(INACTIVITY_MESSAGE)
-    raise KeyboardInterrupt
-
-
-@contextmanager
-def terminal_mode():
-    """Disable flow control and restore terminal settings and handlers on exit."""
-    descriptor = sys.stdin.fileno()
-    original = termios.tcgetattr(descriptor)
-    settings = original[:]
-    settings[0] &= ~(termios.IXON | termios.IXOFF)
-    previous_handlers = {}
-    try:
-        for signum in (signal.SIGTSTP, signal.SIGQUIT, signal.SIGALRM):
-            previous_handlers[signum] = signal.signal(signum, interrupt_exit)
-        termios.tcsetattr(descriptor, termios.TCSANOW, settings)
-        yield
-    finally:
-        try:
-            # Discard unfinished input and restore echo even after interrupted getpass.
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            termios.tcsetattr(descriptor, termios.TCSAFLUSH, original)
-        finally:
-            for signum, handler in previous_handlers.items():
-                signal.signal(signum, handler)
-
-
 def main() -> int:
     """Open resources, run the terminal interface, and always close resources."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -687,20 +593,20 @@ def main() -> int:
     database = None
     log_handler = None
     try:
-        with terminal_mode():
+        with sessions.terminal_mode():
             log_handler = audit.configure_logging()
             database = open_database()
             run(database)
     except (EOFError, KeyboardInterrupt):
         print("\nExiting.")
-    except termios.error:
+    except TerminalError:
         print("Unable to configure or restore terminal settings.", file=sys.stderr)
         return 1
     except (OSError, sqlite3.Error):
         audit.log_event("operation_failed", operation="application_files")
         print("Unable to access application files. Check permissions and disk space.")
         return 1
-    except getpass.GetPassWarning:
+    except GetPassWarning:
         print("Hidden password input is unavailable. Exiting.")
         return 1
     except UnsupportedAlgorithm:
