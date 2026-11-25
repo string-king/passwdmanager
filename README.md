@@ -4,10 +4,20 @@ A terminal password manager for the ICS0022 Secure Programming project.
 Each account has its own encrypted vault. You can save, browse, edit, delete,
 and copy credentials without displaying passwords.
 
+## Requirements
+
+- macOS with the clipboard commands `pbcopy` and `pbpaste`.
+- Python 3.15, the version used for development and testing.
+- An interactive terminal that supports hidden password input.
+- The `cryptography` package, installed during setup from `requirements.txt`.
+- Write permission in the project directory to create the database and logs.
+
+SQLite comes with Python, so no database server is needed. The `coverage`
+package is only needed to generate test coverage reports.
+
 ## Setup and run
 
-Use macOS with Python 3.15. The application uses the macOS clipboard commands
-`pbcopy` and `pbpaste`. Run these commands from the project directory:
+Run these commands from the project directory:
 
 ```sh
 python3.15 -m venv .venv
@@ -15,9 +25,6 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python passwdmanager.py
 ```
-
-Run it in an interactive terminal. The only external runtime package is
-`cryptography`; SQLite is included with Python.
 
 For later runs, activate the environment and start the application:
 
