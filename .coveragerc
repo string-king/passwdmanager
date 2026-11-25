@@ -6,6 +6,7 @@ source =
     audit
     clipboard
     session
+    vault
 relative_files = True
 
 [report]
