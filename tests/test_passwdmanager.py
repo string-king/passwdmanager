@@ -71,6 +71,13 @@ class VaultTests(unittest.TestCase):
         vault.delete_entry(self.database, self.session, entry_id)
         self.assertEqual([row["id"] for row in vault.list_entries(self.database, self.session)], [other_id])
 
+    def test_editing_display_fields_preserves_existing_password(self):
+        entry_id = self.add_entry()
+        vault.update_entry(self.database, self.session, entry_id, "Changed", "new user")
+        entry = vault.load_entry(self.database, self.session, entry_id)
+        self.assertEqual((entry["service"], entry["username"], entry["password"]),
+                         ("Changed", "new user", "entry secret"))
+
     def test_another_account_cannot_read_update_or_delete_entry(self):
         entry_id = self.add_entry()
         vault.register_account(self.database, "bob", "bob master password")

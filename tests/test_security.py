@@ -136,6 +136,22 @@ class ClipboardTests(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[0][0], "/usr/bin/pbpaste")
 
+    def test_outdated_timer_does_not_clear_a_newer_copy(self):
+        with patch.object(clipboard.subprocess, "run") as command:
+            self.clipboard.copy("first secret")
+            old_generation = self.clipboard.generation
+            command.return_value.stdout = b"first secret"
+            self.clipboard.copy("new secret")
+            new_digest = self.clipboard.digest
+            new_timer = self.clipboard.timer
+            command.reset_mock()
+
+            self.clipboard.clear(old_generation)
+
+            command.assert_not_called()
+            self.assertEqual(self.clipboard.digest, new_digest)
+            self.assertIs(self.clipboard.timer, new_timer)
+
     def test_failed_copy_still_clears_password_if_it_was_written(self):
         responses = [subprocess.TimeoutExpired("pbcopy", 3),
                      subprocess.CompletedProcess([], 0, stdout=b"secret"),
