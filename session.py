@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import getpass
+import math
 import signal
 import sys
 import termios
@@ -17,6 +18,32 @@ import security
 
 IDLE_SECONDS = 5 * 60
 INACTIVITY_MESSAGE = "Vault locked after five minutes of inactivity."
+LOGIN_ATTEMPTS = 3
+LOGIN_COOLDOWN_SECONDS = 30
+
+
+class LoginCooldown:
+    """Limit login attempts across menus for this application run only."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.failures = 0
+        self.deadline = 0
+
+    def remaining_seconds(self) -> int:
+        remaining = self.deadline - time.monotonic()
+        if remaining > 0:
+            return math.ceil(remaining)
+        if self.deadline:
+            self.reset()
+        return 0
+
+    def record_failure(self):
+        self.failures += 1
+        if self.failures == LOGIN_ATTEMPTS:
+            self.deadline = time.monotonic() + LOGIN_COOLDOWN_SECONDS
 
 
 class SessionExpired(Exception):

@@ -90,18 +90,48 @@ class VaultTests(unittest.TestCase):
 
     def test_failed_login_can_retry_or_return_without_exposing_secrets(self):
         output = io.StringIO()
+        cooldown = sessions.LoginCooldown()
         with patch("builtins.input", side_effect=["unknown", "invalid choice", "1", "alice"]):
             with patch.object(sessions, "read_password", side_effect=["wrong password", "alice master password"]):
                 with contextlib.redirect_stdout(output):
-                    session = pm.prompt_login(self.database)
+                    session = pm.prompt_login(self.database, cooldown)
         self.addCleanup(session.lock)
         self.assertEqual(session.owner_id, self.session.owner_id)
+        self.assertEqual(cooldown.failures, 0)
         with patch("builtins.input", side_effect=["unknown", "2"]):
             with patch.object(sessions, "read_password", return_value="wrong password"):
                 with contextlib.redirect_stdout(output):
-                    self.assertIsNone(pm.prompt_login(self.database))
+                    self.assertIsNone(pm.prompt_login(self.database, cooldown))
         self.assertNotIn("wrong password", output.getvalue())
         self.assertNotIn("alice master password", output.getvalue())
+
+    def test_three_failed_logins_block_further_input_until_cooldown_expires(self):
+        cooldown = sessions.LoginCooldown()
+        output = io.StringIO()
+        with patch.object(sessions.time, "monotonic", return_value=100):
+            for username in ["alice", "unknown", "alice"]:
+                # Return to the welcome menu after each of the first two failures.
+                with patch("builtins.input", side_effect=[username, "2"]):
+                    with patch.object(sessions, "read_password", return_value="wrong password"):
+                        with contextlib.redirect_stdout(output):
+                            self.assertIsNone(pm.prompt_login(self.database, cooldown))
+            with patch("builtins.input") as read_input:
+                with patch.object(sessions, "read_password") as read_password:
+                    with patch.object(vault, "login_account") as login:
+                        with contextlib.redirect_stdout(output):
+                            self.assertIsNone(pm.prompt_login(self.database, cooldown))
+                        login.assert_not_called()
+                read_password.assert_not_called()
+            read_input.assert_not_called()
+        self.assertIn("Try again in 30 seconds", output.getvalue())
+        with patch.object(sessions.time, "monotonic", return_value=130):
+            with patch("builtins.input", return_value="alice"):
+                with patch.object(sessions, "read_password", return_value="alice master password"):
+                    with contextlib.redirect_stdout(output):
+                        session = pm.prompt_login(self.database, cooldown)
+        self.addCleanup(session.lock)
+        self.assertEqual(session.owner_id, self.session.owner_id)
+        self.assertEqual(cooldown.failures, 0)
 
     def test_credentials_are_encrypted_and_readable_after_reopening(self):
         entry_id = self.add_entry()

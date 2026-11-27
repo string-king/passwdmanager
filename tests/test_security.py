@@ -17,6 +17,22 @@ import security
 
 
 class SecurityTests(unittest.TestCase):
+    def test_login_cooldown_resets_at_expiry_and_shows_remaining_seconds(self):
+        cooldown = sessions.LoginCooldown()
+        with patch.object(sessions.time, "monotonic", return_value=100):
+            cooldown.record_failure()
+            cooldown.record_failure()
+            self.assertEqual(cooldown.remaining_seconds(), 0)
+            cooldown.record_failure()
+            self.assertEqual(cooldown.remaining_seconds(), 30)
+        with patch.object(sessions.time, "monotonic", return_value=129.5):
+            self.assertEqual(cooldown.remaining_seconds(), 1)
+        with patch.object(sessions.time, "monotonic", return_value=130):
+            self.assertEqual(cooldown.remaining_seconds(), 0)
+        self.assertEqual(cooldown.failures, 0)
+        cooldown.record_failure()
+        self.assertEqual(cooldown.failures, 1)
+
     def test_password_length_boundaries(self):
         for password in ["", "x" * 11, "x" * 1025, None]:
             with self.subTest(length=len(password) if password is not None else None):

@@ -256,24 +256,36 @@ def prompt_registration(database: sqlite3.Connection):
             confirmation = None
 
 
-def prompt_login(database: sqlite3.Connection) -> sessions.Session | None:
+def prompt_login(database: sqlite3.Connection,
+                 cooldown: sessions.LoginCooldown) -> sessions.Session | None:
     """Offer another login attempt or return without revealing account existence."""
     print("Log in — enter your account username and master password to unlock your vault.")
     print("Your master password is hidden while you type.")
     while True:
+        remaining = cooldown.remaining_seconds()
+        if remaining:
+            clear_console()
+            print(f"Too many failed login attempts. Try again in {remaining} seconds.")
+            return None
         username = input("Account username: ")
         password = sessions.read_password("Master password (hidden): ")
         try:
-            return vault.login_account(database, username, password)
+            session = vault.login_account(database, username, password)
+            cooldown.reset()
+            return session
         except ValueError:
+            cooldown.record_failure()
             print("Unable to log in. Check your username and master password.")
         finally:
             password = None
+        if cooldown.failures == sessions.LOGIN_ATTEMPTS:
+            continue
         while True:
             choice = input("1. Try logging in again  2. Return to the welcome menu: ").strip()
             if choice == "1":
                 break
             if choice == "2":
+                clear_console()
                 return None
             print("Choose 1 to retry or 2 to return to the welcome menu.")
 
@@ -352,6 +364,7 @@ def run_vault(database: sqlite3.Connection, session: sessions.Session) -> bool:
 
 def run(database: sqlite3.Connection):
     """Run the start menu and hand successful logins to the vault menu."""
+    cooldown = sessions.LoginCooldown()
     clear_console()
     while True:
         print("\nWelcome to Password Manager")
@@ -371,9 +384,8 @@ def run(database: sqlite3.Connection):
                 clear_console()
                 print(error)
         elif choice == "2":
-            session = prompt_login(database)
+            session = prompt_login(database, cooldown)
             if session is None:
-                clear_console()
                 continue
             if run_vault(database, session):
                 print("Exiting password manager. Goodbye.")
